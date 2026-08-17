@@ -90,7 +90,9 @@ sử), bị loại bỏ tường minh (`dropna()`), ghi rõ số dòng bị lo�
 theo đúng kỷ luật "không bịa số liệu", không impute.
 
 Hàm chính: `compute_causal_features(ohlcv: pd.DataFrame) -> pd.DataFrame` trả về
-DataFrame index theo ngày (đã bỏ warmup), cột là 7 đặc trưng trên.
+DataFrame index theo ngày (đã bỏ warmup), cột là đúng **9 đặc trưng** trong
+bảng trên (`ret_1, ret_5, ret_20, realized_vol_5, realized_vol_20,
+volume_change_1, relative_volume_20, high_low_range, drawdown_from_high_60`).
 
 ## 5. Đặc trưng posterior biến động từ MS-EGARCH (`regime/posterior_features.py`)
 
@@ -161,7 +163,7 @@ liệu này.
 
 Wrapper mỏng quanh `ExplainableBoostingClassifier` (package `interpret`, đã có
 sẵn trong môi trường — đã kiểm tra `interpret.glassbox`). Input: ma trận đặc
-trưng nối 7 cột từ `causal.py` + 2 cột từ `posterior_features.py` = 9 cột.
+trưng nối 9 cột từ `causal.py` + 2 cột từ `posterior_features.py` = 11 cột.
 `random_state` cố định để tái lập. Không tự ý thêm `interactions` cao (giữ mặc
 định thấp, tránh overfit trên ~4-5 nghìn dòng train). Hàm chính:
 `fit_ebm_classifier(X_train, y_train, **kwargs) -> ExplainableBoostingClassifier`,
