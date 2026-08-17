@@ -8,7 +8,9 @@ from raemf_mc.regime.ms_egarch import (
     MSEGARCHParamLayout,
     run_ms_egarch_recursion,
     sample_ms_egarch_draw,
+    unpack_params,
 )
+from raemf_mc.regime.state_alignment import STATE_NAMES, align_states, apply_alignment
 
 
 def canonical_theta(posterior: PooledPosterior) -> torch.Tensor:
@@ -55,3 +57,28 @@ def compute_posterior_volatility_features(
         },
         index=returns.index,
     )
+
+
+def compute_regime_labels(
+    posterior: PooledPosterior,
+    returns: pd.Series,
+    init_log_var: torch.Tensor,
+    init_log_state_prob: torch.Tensor,
+    layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
+) -> pd.Series:
+    """Deterministic target label per session: argmax of the train-aligned
+    filtered regime probability, using the canonical (posterior-mean)
+    parameter point estimate — a single reproducible ground-truth proxy
+    sequence, not an ensemble (unlike the volatility features above, which
+    deliberately use random draws to capture posterior spread)."""
+    theta = canonical_theta(posterior)
+    params = unpack_params(theta, layout)
+    returns_tensor = torch.tensor(returns.to_numpy(), dtype=torch.float32)
+    result = run_ms_egarch_recursion(
+        returns_tensor, params, init_log_var, init_log_state_prob
+    )
+    permutation = align_states(returns_tensor, result["log_filtered_prob"])
+    aligned = apply_alignment(result["log_filtered_prob"], permutation)
+    label_idx = aligned.argmax(dim=1).tolist()
+    labels = [STATE_NAMES[i] for i in label_idx]
+    return pd.Series(labels, index=returns.index, name="regime_label")

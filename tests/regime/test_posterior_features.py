@@ -9,6 +9,8 @@ from raemf_mc.regime.posterior_features import (
     canonical_theta,
     compute_posterior_volatility_features,
 )
+from raemf_mc.regime.state_alignment import STATE_NAMES
+from raemf_mc.regime.posterior_features import compute_regime_labels
 
 
 def _fake_posterior(mus: list[torch.Tensor], layout: MSEGARCHParamLayout) -> PooledPosterior:
@@ -72,3 +74,24 @@ def test_posterior_volatility_features_reproducible_with_fixed_generator():
         layout=layout, n_draws=5, generator=gen2,
     )
     pd.testing.assert_frame_equal(features_1, features_2)
+
+
+def test_regime_labels_are_valid_state_names_and_reproducible():
+    layout = MSEGARCHParamLayout()
+    torch.manual_seed(3)
+    mus = [torch.randn(layout.total) * 0.05 for _ in range(2)]
+    posterior = _fake_posterior(mus, layout)
+    dates = pd.date_range("2020-01-01", periods=40, freq="D")
+    returns = pd.Series(torch.randn(40).numpy() * 0.01, index=dates)
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    labels_1 = compute_regime_labels(
+        posterior, returns, init_log_var, init_log_state_prob, layout=layout
+    )
+    labels_2 = compute_regime_labels(
+        posterior, returns, init_log_var, init_log_state_prob, layout=layout
+    )
+    assert labels_1.name == "regime_label"
+    assert list(labels_1.index) == list(dates)
+    assert set(labels_1.unique()).issubset(set(STATE_NAMES))
+    pd.testing.assert_series_equal(labels_1, labels_2)  # deterministic, no sampling
