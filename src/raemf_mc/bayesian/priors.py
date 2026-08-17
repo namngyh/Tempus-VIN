@@ -27,9 +27,9 @@ def hierarchical_normal_log_prob(
     shrinkage_weight: torch.Tensor,
 ) -> torch.Tensor:
     """log p(state_params | hyper_mean) under
-    Normal(hyper_mean, base_scale / shrinkage_weight). A smaller
+    Normal(hyper_mean, base_scale * shrinkage_weight). A smaller
     shrinkage_weight tightens the effective prior std, pulling the state
     parameter harder toward the shared hyper-mean."""
-    scale = base_scale / shrinkage_weight
+    scale = base_scale * shrinkage_weight
     dist = torch.distributions.Normal(hyper_mean, scale)
     return dist.log_prob(state_params).sum()
