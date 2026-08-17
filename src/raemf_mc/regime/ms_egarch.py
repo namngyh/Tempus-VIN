@@ -2,8 +2,21 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
+
+from raemf_mc.bayesian.priors import (
+    HierarchicalPriorConfig,
+    hierarchical_normal_log_prob,
+    state_shrinkage_weight,
+)
+from raemf_mc.bayesian.torch_backend import (
+    AdviConfig,
+    PooledPosterior,
+    fit_multi_seed_advi,
+    sample_joint_draw,
+)
 
 N_STATES = 4
 
@@ -185,3 +198,76 @@ def run_ms_egarch_recursion(
         "total_log_lik": total_log_lik,
         "nu": nu,
     }
+
+
+def build_ms_egarch_log_joint(
+    returns: torch.Tensor,
+    init_log_var: torch.Tensor,
+    init_log_state_prob: torch.Tensor,
+    prior_config: HierarchicalPriorConfig,
+    layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build the MS-EGARCH log_joint(theta) callable consumed by the
+    generic ADVI engine: log-likelihood from the Gray's-collapsing
+    recursion plus a hierarchical shrinkage prior on the per-state EGARCH
+    parameters (heavier shrinkage for states with fewer effective
+    observations, e.g. Stress) and weakly-informative Normal(0,1) priors
+    on the transition logits and nu.
+    """
+
+    def log_joint(theta: torch.Tensor) -> torch.Tensor:
+        params = unpack_params(theta, layout)
+        result = run_ms_egarch_recursion(returns, params, init_log_var, init_log_state_prob)
+        log_lik = result["total_log_lik"]
+
+        effective_obs = torch.exp(result["log_filtered_prob"]).sum(dim=0)
+        weight = state_shrinkage_weight(effective_obs, prior_config.min_effective_observations)
+        scale = torch.tensor(prior_config.hyper_mean_scale, dtype=theta.dtype)
+
+        log_prior = torch.zeros((), dtype=theta.dtype, device=theta.device)
+        for state_params in (params.omega, params.alpha, params.beta, params.gamma):
+            hyper_mean = state_params.mean()
+            log_prior = log_prior + hierarchical_normal_log_prob(
+                state_params, hyper_mean, scale, weight
+            )
+        log_prior = log_prior + torch.distributions.Normal(0.0, 1.0).log_prob(
+            params.transition_logits
+        ).sum()
+        log_prior = log_prior + torch.distributions.Normal(0.0, 1.0).log_prob(
+            params.nu_raw
+        ).sum()
+
+        return log_lik + log_prior
+
+    return log_joint
+
+
+def fit_ms_egarch(
+    returns: torch.Tensor,
+    advi_config: AdviConfig,
+    prior_config: HierarchicalPriorConfig,
+    seeds: list[int],
+    device: torch.device,
+    layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
+    fallback_log_path: str = "fallbacks.json",
+) -> PooledPosterior:
+    n = layout.n_states
+    init_log_var = torch.zeros(n)
+    init_log_state_prob = torch.log(torch.full((n,), 1.0 / n))
+    log_joint = build_ms_egarch_log_joint(
+        returns, init_log_var, init_log_state_prob, prior_config, layout
+    )
+    init_mu = torch.zeros(layout.total)
+    init_log_sigma = torch.full((layout.total,), -1.0)
+    return fit_multi_seed_advi(
+        log_joint, init_mu, init_log_sigma, advi_config, seeds, device, fallback_log_path
+    )
+
+
+def sample_ms_egarch_draw(
+    posterior: PooledPosterior,
+    layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
+    generator: torch.Generator | None = None,
+) -> MSEGARCHParams:
+    theta = sample_joint_draw(posterior, generator=generator)
+    return unpack_params(theta, layout)
