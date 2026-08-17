@@ -45,6 +45,7 @@ def assert_no_float16(*tensors: torch.Tensor) -> None:
 
 def append_fallback_log(event: dict, path: str | Path = "fallbacks.json") -> None:
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     existing = []
     if path.exists():
         existing = json.loads(path.read_text())
@@ -73,7 +74,18 @@ def _single_attempt(
     seed: int,
     device: torch.device,
     learning_rate: float,
-) -> tuple[torch.Tensor, torch.Tensor, list[float], bool]:
+) -> tuple[torch.Tensor, torch.Tensor, list[float], bool, str | None]:
+    """Run one ADVI attempt.
+
+    Returns (mu, log_sigma, elbo_trace, completed_without_divergence,
+    failure_reason). The returned mu/log_sigma are always guaranteed finite:
+    the snapshot is only refreshed when both tensors are entirely finite, so
+    a step that has a finite loss but produces NaN gradients (e.g. a 0/0
+    inside log_joint) cannot poison the state that a later divergence
+    reverts to. Without that guard the caller would report
+    `fallback_used=True` with a reason naming a "last finite step" while
+    handing back NaNs.
+    """
     generator = torch.Generator(device=device).manual_seed(seed)
     mu = init_mu.clone().to(device).requires_grad_(True)
     log_sigma = init_log_sigma.clone().to(device).requires_grad_(True)
@@ -92,16 +104,36 @@ def _single_attempt(
         optimizer.zero_grad()
         sigma = torch.exp(log_sigma)
         elbo_samples = []
-        for _ in range(config.n_mc_samples):
-            eps = torch.randn(mu.shape, generator=generator, device=device)
-            theta = mu + sigma * eps
-            elbo_samples.append(log_joint_fn(theta))
+        try:
+            for _ in range(config.n_mc_samples):
+                eps = torch.randn(mu.shape, generator=generator, device=device)
+                theta = mu + sigma * eps
+                elbo_samples.append(log_joint_fn(theta))
+        except (ValueError, RuntimeError, ArithmeticError) as exc:
+            # log_joint can raise instead of returning a non-finite value —
+            # torch.distributions argument validation rejects a NaN scale,
+            # for instance. That is the same failure as a non-finite loss and
+            # must take the same retry/fallback path rather than escaping
+            # uncaught and bypassing it entirely.
+            return (
+                last_finite_mu,
+                last_finite_log_sigma,
+                elbo_trace,
+                False,
+                f"log_joint_raised: {type(exc).__name__}: {exc}",
+            )
         mean_log_joint = torch.stack(elbo_samples).mean()
         elbo = mean_log_joint + _gaussian_entropy(log_sigma)
         loss = -elbo
 
         if not torch.isfinite(loss):
-            return last_finite_mu, last_finite_log_sigma, elbo_trace, False
+            return (
+                last_finite_mu,
+                last_finite_log_sigma,
+                elbo_trace,
+                False,
+                "elbo_diverged_nan_or_inf",
+            )
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_([mu, log_sigma], config.grad_clip_norm)
@@ -110,7 +142,14 @@ def _single_attempt(
 
         elbo_value = elbo.item()
         elbo_trace.append(elbo_value)
-        last_finite_mu, last_finite_log_sigma = mu.detach().clone(), log_sigma.detach().clone()
+        # Only snapshot genuinely finite state. The loss above can be finite
+        # while the gradients are not, in which case optimizer.step() has just
+        # written NaNs into mu/log_sigma; storing that as the "last finite"
+        # state would make the fallback path return NaNs under a name that
+        # promises otherwise.
+        if torch.isfinite(mu).all() and torch.isfinite(log_sigma).all():
+            last_finite_mu = mu.detach().clone()
+            last_finite_log_sigma = log_sigma.detach().clone()
 
         window = elbo_trace[-config.elbo_ma_window :]
         moving_avg = sum(window) / len(window)
@@ -122,7 +161,7 @@ def _single_attempt(
         if patience_counter >= config.early_stop_patience:
             break
 
-    return last_finite_mu, last_finite_log_sigma, elbo_trace, True
+    return last_finite_mu, last_finite_log_sigma, elbo_trace, True, None
 
 
 def fit_mean_field_advi(
@@ -140,7 +179,7 @@ def fit_mean_field_advi(
     n_retries = 0
     fallback_used = False
     fallback_reason = None
-    mu, log_sigma, elbo_trace, converged = _single_attempt(
+    mu, log_sigma, elbo_trace, converged, failure_reason = _single_attempt(
         log_joint_fn, init_mu, init_log_sigma, config, seed, device, lr
     )
 
@@ -151,10 +190,10 @@ def fit_mean_field_advi(
             "seed": seed,
             "retry_number": n_retries,
             "new_learning_rate": lr,
-            "reason": "elbo_diverged_nan_or_inf",
+            "reason": failure_reason or "elbo_diverged_nan_or_inf",
         }
         append_fallback_log(event, fallback_log_path)
-        mu, log_sigma, elbo_trace, converged = _single_attempt(
+        mu, log_sigma, elbo_trace, converged, failure_reason = _single_attempt(
             log_joint_fn, init_mu, init_log_sigma, config, seed, device, lr
         )
 
@@ -162,7 +201,12 @@ def fit_mean_field_advi(
         fallback_used = True
         fallback_reason = "exhausted_retries_reverted_to_last_finite_step"
         append_fallback_log(
-            {"seed": seed, "reason": fallback_reason, "n_retries": n_retries},
+            {
+                "seed": seed,
+                "reason": fallback_reason,
+                "last_failure": failure_reason,
+                "n_retries": n_retries,
+            },
             fallback_log_path,
         )
 
