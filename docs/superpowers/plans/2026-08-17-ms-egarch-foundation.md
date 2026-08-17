@@ -21,6 +21,7 @@
 - Gray's collapsing is done in level-space via `torch.logsumexp(log_filtered_prob + log_var)`, never by averaging log-variances directly (see spec §7.2).
 - `z[t-1]` for the leverage term is standardized by the collapsed `sigma_bar[t-1]`, not by any single state's sigma (see spec §7.3).
 - All exact row counts referenced below (6307 total, 1 duplicate, 89 invariant violations, 6217 final) were verified against the real committed `data/raw/VNINDEX_Daily.csv` — do not treat them as estimates.
+  - **ERRATUM (final whole-branch review, finding C1):** the 89/6217 figures were verified against a *buggy parser*. The reconstruct step concatenated a `"1"` thousands prefix with its remainder group without restoring the leading zeros the source export strips, so `1,024.00` (raw pair `"1"`,`"24"`) parsed as `124.0`. 47 of the 89 "invariant violations" were this parser bug, not source corruption. Corrected counts, re-verified against the same committed CSV: **6307 total, 1 duplicate, 42 invariant violations, 6264 final**. Every `89`/`6217`/`90` below is superseded; see spec §4.2–§4.3.
 
 ---
 

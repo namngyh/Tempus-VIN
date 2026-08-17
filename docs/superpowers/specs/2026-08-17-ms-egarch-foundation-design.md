@@ -114,7 +114,10 @@ liệu (không phải suy đoán):
 parts = các field không rỗng sau cột Date
 for mỗi trong 4 slot [Open, High, Low, Close]:
     if parts[idx] == "1":
-        value = parts[idx] + parts[idx+1]   # nối chuỗi, vd "1"+"829.5" = "1829.5"
+        rest = parts[idx+1]
+        # pad phần nguyên của rest về đủ 3 chữ số trước khi nối:
+        # "1"+"829.5" -> "1829.5" (no-op), "1"+"24" -> "1024"
+        value = parts[idx] + pad3(phần nguyên của rest) + phần thập phân
         idx += 2
     else:
         value = parts[idx]
@@ -122,19 +125,42 @@ for mỗi trong 4 slot [Open, High, Low, Close]:
 volume = int("".join(parts[idx:]))            # nối toàn bộ field còn lại
 ```
 
+Bước zero-pad là bắt buộc: nguồn xuất file **cắt bỏ số 0 đứng đầu của nhóm dư
+hàng nghìn**, nên `1,024.00` xuất ra thành cặp field `"1"`, `"24"` chứ không phải
+`"1"`, `"024.00"`. Xem §4.3 để biết vì sao bỏ qua bước này lại nguy hiểm.
+
 ### 4.3 Validation gate — không bịa số liệu
 
 Sau khi parse, mỗi dòng phải thoả bất biến `Low <= Open <= High` và
-`Low <= Close <= High`. Đã kiểm tra thực tế: **89/6.307 dòng (~1.4%)** vi phạm sau
-khi parse bằng thuật toán trên — tập trung ở các đoạn giá gần ranh giới hàng trăm/
-nghìn (2007, 2018), khả năng cao dữ liệu nguồn bị hỏng theo cách không thể tái tạo
-chắc chắn bằng quy tắc trên (đã thử debug, không tìm được cách ghép khác cho ra
-kết quả nhất quán).
+`Low <= Close <= High`. Con số vi phạm thực tế: **42/6.307 dòng (~0,67%)**.
+
+Ghi chú đính chính (phát hiện ở vòng review toàn nhánh): bản đầu tiên của tài liệu
+này ghi **89 dòng** vi phạm và kết luận "khả năng cao dữ liệu nguồn bị hỏng theo
+cách không thể tái tạo chắc chắn". Kết luận đó **sai với 47 trong 89 dòng**: đó
+không phải lỗi nguồn mà là lỗi của chính thuật toán reconstruct. Cơ chế cụ thể:
+nguồn cắt bỏ số 0 đứng đầu của nhóm dư hàng nghìn, nên dòng raw 1458
+(`19/1/2007 00:00,1,24,1,24,1,22.97,1,23.05,8,751,729`) có giá trị thật là
+Open/High = 1.024,00, Low = 1.022,97, Close = 1.023,05, nhưng phép nối chuỗi trần
+`"1" + "24"` cho ra `124`. Sau khi thêm bước zero-pad ở §4.2, 47 dòng này được
+khôi phục đúng và chỉ còn **42 dòng thực sự hỏng ở nguồn, không tái tạo được**.
+
+Nguy hiểm của lớp lỗi này: giá trị sai ~10 lần nhưng **nhất quán nội bộ**
+(cả 4 giá O/H/L/C cùng sai một hệ số), nên nó **vượt qua toàn bộ bất biến OHLC**
+và trôi thẳng vào mô hình. Nó chỉ lộ ra ở tầng chuỗi thời gian: chuỗi cũ có 187
+phiên với |log return| > 8% và một phiên nhảy 453% — bất khả thi khi VN-Index có
+biên độ dao động ±7%/phiên. Chuỗi đã sửa chỉ còn đúng 1 phiên vượt 8%
+(2025-04-03 → 2025-04-08, ~8,2%, một sự kiện thị trường có thật).
+
+Vì vậy pipeline có thêm một cổng kiểm tra ở tầng chuỗi:
+`check_implausible_daily_moves()` đếm số phiên có |log return| vượt ngưỡng 0,10
+(nới từ biên độ ±7% thật để chừa biên an toàn), log cảnh báo khi có vài phiên và
+raise lỗi cứng khi số phiên vượt ngưỡng đủ nhiều để chỉ ra hỏng dữ liệu có hệ
+thống. Đây chính là cổng lẽ ra phải bắt được lỗi trên ngay từ đầu.
 
 Chính sách: **loại bỏ các dòng vi phạm, không đoán/sửa giá trị.** Ghi log đầy đủ
 (ngày, giá trị raw, lý do) vào `docs/data_ingestion_notes.md`. `ingest.py` raise
-lỗi cứng nếu tỷ lệ dòng bị loại vượt ngưỡng bất thường (đề xuất 5%) — vì 1.4% dưới
-ngưỡng này nên pipeline tiếp tục chạy nhưng luôn log rõ.
+lỗi cứng nếu tỷ lệ dòng bị loại vượt ngưỡng bất thường (đề xuất 5%) — vì 0,67%
+dưới ngưỡng này nên pipeline tiếp tục chạy nhưng luôn log rõ.
 
 Đã phát hiện thêm: **1 dòng trùng lặp tuyệt đối** (17/12/2024, byte-identical với
 dòng ngay trước) → drop bản sao, giữ một bản, log lại.

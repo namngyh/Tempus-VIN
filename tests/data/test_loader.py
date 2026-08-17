@@ -16,21 +16,21 @@ def test_load_vnindex_ohlcv_returns_indexed_frame():
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
     assert df.index.is_monotonic_increasing
     assert df.index.is_unique
-    assert len(df) == 6217
+    assert len(df) == 6264
 
 
 def test_load_vnindex_ohlcv_with_report_returns_dropped_rows():
     df, dropped, total = load_vnindex_ohlcv_with_report()
     assert total == 6307
-    assert len(dropped) == 90
-    assert len(df) == 6217
+    assert len(dropped) == 43
+    assert len(df) == 6264
 
 
 def test_write_ingestion_notes_produces_markdown(tmp_path):
     _, dropped, total = load_vnindex_ohlcv_with_report()
     out = tmp_path / "notes.md"
-    write_ingestion_notes(dropped, total_parsed=total, final_count=6217, output_path=out)
+    write_ingestion_notes(dropped, total_parsed=total, final_count=6264, output_path=out)
     text = out.read_text(encoding="utf-8")
     assert "6307" in text
-    assert "6217" in text
+    assert "6264" in text
     assert "2024-12-17" in text
