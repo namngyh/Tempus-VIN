@@ -1,0 +1,19 @@
+# Profile scale-up nhieu seed/nhieu buoc ADVI cho may co CUDA.
+# Chua chay - chuan bi san de dung khi chuyen sang may co GPU.
+device_preference: auto
+window_sessions: null        # dung toan bo chuoi du lieu da lam sach
+seeds: [0, 1, 2, 3, 4, 5, 6, 7]
+advi:
+  n_steps: 20000
+  learning_rate: 0.01
+  warmup_steps: 500
+  grad_clip_norm: 10.0
+  elbo_ma_window: 200
+  early_stop_patience: 2000
+  min_delta: 0.0001
+  retry_lr_factor: 0.5
+  max_retries: 3
+  n_mc_samples: 8
+prior:
+  hyper_mean_scale: 1.0
+  min_effective_observations: 30.0

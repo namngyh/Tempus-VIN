@@ -1,0 +1,19 @@
+# Profile debug nhanh tren CPU: cua so du lieu ngan, it buoc ADVI, 1 seed.
+# Dung de kiem tra dung/sai truoc khi chay full-scale.
+device_preference: auto
+window_sessions: 500        # chi dung 500 phien gan nhat de lap nhanh
+seeds: [0]
+advi:
+  n_steps: 300
+  learning_rate: 0.05
+  warmup_steps: 20
+  grad_clip_norm: 10.0
+  elbo_ma_window: 20
+  early_stop_patience: 100
+  min_delta: 0.001
+  retry_lr_factor: 0.5
+  max_retries: 3
+  n_mc_samples: 4
+prior:
+  hyper_mean_scale: 1.0
+  min_effective_observations: 30.0
