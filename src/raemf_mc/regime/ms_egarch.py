@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -14,11 +15,24 @@ from raemf_mc.bayesian.priors import (
 from raemf_mc.bayesian.torch_backend import (
     AdviConfig,
     PooledPosterior,
+    append_fallback_log,
     fit_multi_seed_advi,
     sample_joint_draw,
 )
 
 N_STATES = 4
+
+# Fraction of (timestep, state) recursion cells allowed to sit on the
+# log-variance clamp boundary before the fit is flagged. The clamp below
+# prevents a NaN, but it is not free: a saturated cell has exactly zero
+# gradient, so ADVI sees a flat plateau rather than an error and keeps
+# reporting a clean status while learning nothing from those cells. That is
+# a silent fallback in substance, so it needs to be reported like one. 5% is
+# a judgement call: isolated saturation during early exploration is normal
+# and self-correcting, but a persistent fraction this high means the sampled
+# thetas are routinely explosive and the resulting posterior is not
+# trustworthy.
+CLAMP_SATURATION_REPORT_FRACTION = 0.05
 
 # Bound on |log_var_t| enforced every recursion step. The EGARCH log-variance
 # recursion has no built-in stationarity constraint (unlike GARCH, beta_k is
@@ -98,6 +112,47 @@ def transition_matrix(transition_logits: torch.Tensor) -> torch.Tensor:
     return torch.softmax(full_logits, dim=1)
 
 
+def transition_logit_prior_loc(
+    n_states: int,
+    stay_prob: float,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Prior mean for the (n, n-1) transition-logit block that implies a
+    self-transition probability of `stay_prob` in every row.
+
+    Must respect the reference-category convention in `transition_matrix`:
+    row k's simplex is softmax([0, logits_k]), so column 0 is pinned at logit
+    0. For row 0 the self-transition IS that pinned reference, so staying put
+    means pushing every explicit logit DOWN; for rows k > 0 the self entry
+    sits at index k-1 and must be pushed UP. A flat zero matrix — the old
+    prior mean — is the uniform transition matrix, i.e. p_stay = 1/n.
+    """
+    off = (1.0 - stay_prob) / (n_states - 1)
+    loc = torch.zeros(n_states, n_states - 1, dtype=dtype, device=device)
+    loc[0, :] = math.log(off / stay_prob)
+    for k in range(1, n_states):
+        loc[k, k - 1] = math.log(stay_prob / off)
+    return loc
+
+
+def default_recursion_init(
+    layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Standard (init_log_var, init_log_state_prob) for the recursion:
+    unit initial variance in every state and a uniform initial state
+    distribution. Shared so `fit_ms_egarch` and every downstream caller
+    start the filter identically instead of re-deriving it by hand."""
+    n = layout.n_states
+    init_log_var = torch.zeros(n, dtype=dtype, device=device)
+    init_log_state_prob = torch.log(
+        torch.full((n,), 1.0 / n, dtype=dtype, device=device)
+    )
+    return init_log_var, init_log_state_prob
+
+
 def nu_from_raw(nu_raw: torch.Tensor, min_nu: float = 2.05) -> torch.Tensor:
     """nu = min_nu + softplus(nu_raw), guaranteed strictly > min_nu.
 
@@ -175,15 +230,24 @@ def run_ms_egarch_recursion(
     log_filt_prev = init_log_state_prob
     z_prev = torch.zeros((), dtype=returns.dtype, device=returns.device)
     total_log_lik = torch.zeros((), dtype=returns.dtype, device=returns.device)
+    n_saturated = torch.zeros((), dtype=returns.dtype, device=returns.device)
 
     for t in range(T):
-        log_var_t = (
+        raw_log_var_t = (
             params.omega
             + params.beta * log_var_bar_prev
             + params.alpha * (torch.abs(z_prev) - e_abs_z)
             + params.gamma * z_prev
         )
-        log_var_t = torch.clamp(log_var_t, min=-_LOG_VAR_CLAMP, max=_LOG_VAR_CLAMP)
+        log_var_t = torch.clamp(raw_log_var_t, min=-_LOG_VAR_CLAMP, max=_LOG_VAR_CLAMP)
+        # A clamped cell has an exactly-zero gradient, so it is invisible to
+        # ADVI: no NaN, no retry, no log entry, just a flat plateau. Count the
+        # saturated cells so the caller can tell "the clamp quietly saved us"
+        # apart from "the clamp was never needed". Detached — diagnostic only,
+        # never part of the differentiated objective.
+        n_saturated = n_saturated + (
+            raw_log_var_t.detach().abs() >= _LOG_VAR_CLAMP
+        ).sum().to(returns.dtype)
         log_var[t] = log_var_t
 
         # Hamilton predict step: log P(S_t=k | F_{t-1})
@@ -208,12 +272,14 @@ def run_ms_egarch_recursion(
         log_var_bar_prev = log_var_bar_t
         log_filt_prev = log_filt_t
 
+    n_cells = max(T * n, 1)
     return {
         "log_var": log_var,
         "log_filtered_prob": log_filtered,
         "log_var_bar": log_var_bar,
         "total_log_lik": total_log_lik,
         "nu": nu,
+        "clamp_saturation_fraction": float(n_saturated) / n_cells,
     }
 
 
@@ -223,36 +289,83 @@ def build_ms_egarch_log_joint(
     init_log_state_prob: torch.Tensor,
     prior_config: HierarchicalPriorConfig,
     layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
+    diagnostics: dict | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Build the MS-EGARCH log_joint(theta) callable consumed by the
     generic ADVI engine: log-likelihood from the Gray's-collapsing
-    recursion plus a hierarchical shrinkage prior on the per-state EGARCH
-    parameters (heavier shrinkage for states with fewer effective
-    observations, e.g. Stress) and weakly-informative Normal(0,1) priors
-    on the transition logits and nu.
+    recursion, plus a two-layer prior on the per-state EGARCH parameters
+    (hierarchical shrinkage toward a shared hyper-mean, weighted by each
+    state's effective occupancy, AND a level prior on that hyper-mean),
+    plus weakly-informative priors on the transition logits and nu chosen
+    on the transformed scale rather than the raw one.
+
+    `diagnostics`, if given, accumulates non-differentiable fit diagnostics
+    across every evaluation (currently log-variance clamp saturation).
     """
+    dtype, dev = returns.dtype, returns.device
+    n_states = layout.n_states
+
+    scale = torch.tensor(prior_config.hyper_mean_scale, dtype=dtype, device=dev)
+    # Threshold scales with the window, so the shrinkage mechanism behaves
+    # identically on the 500-session smoke run and the full ~6264-session one.
+    shrinkage_threshold = prior_config.shrinkage_threshold(returns.shape[0])
+
+    def _const(x: float) -> torch.Tensor:
+        return torch.tensor(x, dtype=dtype, device=dev)
+
+    # (loc, scale) level prior on each parameter family's hyper-mean. Without
+    # this the hierarchical term is translation-invariant — it penalizes only
+    # the spread of the four states, so adding a constant to all four beta
+    # values costs nothing and beta is free to wander past 1 (explosive).
+    hyper_mean_priors = (
+        (_const(prior_config.omega_hyper_mean_loc), _const(prior_config.omega_hyper_mean_scale)),
+        (_const(prior_config.alpha_hyper_mean_loc), _const(prior_config.alpha_hyper_mean_scale)),
+        (_const(prior_config.beta_hyper_mean_loc), _const(prior_config.beta_hyper_mean_scale)),
+        (_const(prior_config.gamma_hyper_mean_loc), _const(prior_config.gamma_hyper_mean_scale)),
+    )
+    trans_loc = transition_logit_prior_loc(
+        n_states, prior_config.transition_stay_prob, dtype=dtype, device=dev
+    )
+    trans_scale = _const(prior_config.transition_logit_scale)
+    nu_loc = _const(prior_config.nu_raw_loc)
+    nu_scale = _const(prior_config.nu_raw_scale)
 
     def log_joint(theta: torch.Tensor) -> torch.Tensor:
         params = unpack_params(theta, layout)
         result = run_ms_egarch_recursion(returns, params, init_log_var, init_log_state_prob)
         log_lik = result["total_log_lik"]
 
-        effective_obs = torch.exp(result["log_filtered_prob"]).sum(dim=0)
-        weight = state_shrinkage_weight(effective_obs, prior_config.min_effective_observations)
-        scale = torch.tensor(prior_config.hyper_mean_scale, dtype=theta.dtype)
+        if diagnostics is not None:
+            frac = result["clamp_saturation_fraction"]
+            diagnostics["max_clamp_saturation_fraction"] = max(
+                diagnostics.get("max_clamp_saturation_fraction", 0.0), frac
+            )
+            diagnostics["n_log_joint_evals"] = diagnostics.get("n_log_joint_evals", 0) + 1
+
+        # .detach() is deliberate: occupancy is used here as a fixed,
+        # empirical-Bayes-style weighting of the prior, NOT as part of the
+        # generative model being differentiated through. Left attached, the
+        # prior's normalizing term becomes a function of theta and the model
+        # gains a gradient incentive to starve a regime of occupancy purely to
+        # lighten that regime's own prior penalty — state-killing pressure
+        # that has nothing to do with fitting the data.
+        effective_obs = torch.exp(result["log_filtered_prob"]).sum(dim=0).detach()
+        weight = state_shrinkage_weight(effective_obs, shrinkage_threshold)
 
         log_prior = torch.zeros((), dtype=theta.dtype, device=theta.device)
-        for state_params in (params.omega, params.alpha, params.beta, params.gamma):
+        families = (params.omega, params.alpha, params.beta, params.gamma)
+        for state_params, (loc, sc) in zip(families, hyper_mean_priors):
             hyper_mean = state_params.mean()
             log_prior = log_prior + hierarchical_normal_log_prob(
                 state_params, hyper_mean, scale, weight
             )
-        log_prior = log_prior + torch.distributions.Normal(0.0, 1.0).log_prob(
-            params.transition_logits
-        ).sum()
-        log_prior = log_prior + torch.distributions.Normal(0.0, 1.0).log_prob(
-            params.nu_raw
-        ).sum()
+            log_prior = log_prior + torch.distributions.Normal(loc, sc).log_prob(hyper_mean)
+        log_prior = log_prior + torch.distributions.Normal(
+            trans_loc, trans_scale
+        ).log_prob(params.transition_logits).sum()
+        log_prior = log_prior + torch.distributions.Normal(
+            nu_loc, nu_scale
+        ).log_prob(params.nu_raw).sum()
 
         return log_lik + log_prior
 
@@ -266,19 +379,45 @@ def fit_ms_egarch(
     seeds: list[int],
     device: torch.device,
     layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
-    fallback_log_path: str = "fallbacks.json",
+    fallback_log_path: str | Path = "fallbacks.json",
 ) -> PooledPosterior:
-    n = layout.n_states
-    init_log_var = torch.zeros(n)
-    init_log_state_prob = torch.log(torch.full((n,), 1.0 / n))
-    log_joint = build_ms_egarch_log_joint(
-        returns, init_log_var, init_log_state_prob, prior_config, layout
+    # Everything that meets theta must live on theta's device. theta is built
+    # from mu/log_sigma inside the ADVI engine, which moves them to `device`,
+    # so returns and every prior/init constant have to follow — otherwise
+    # gpu_research.yaml dies on a device-mismatch the moment it sees CUDA.
+    returns = returns.to(device)
+    init_log_var, init_log_state_prob = default_recursion_init(
+        layout, dtype=returns.dtype, device=device
     )
-    init_mu = torch.zeros(layout.total)
-    init_log_sigma = torch.full((layout.total,), -1.0)
-    return fit_multi_seed_advi(
+    diagnostics: dict = {}
+    log_joint = build_ms_egarch_log_joint(
+        returns, init_log_var, init_log_state_prob, prior_config, layout, diagnostics
+    )
+    init_mu = torch.zeros(layout.total, dtype=returns.dtype, device=device)
+    init_log_sigma = torch.full(
+        (layout.total,), -1.0, dtype=returns.dtype, device=device
+    )
+    posterior = fit_multi_seed_advi(
         log_joint, init_mu, init_log_sigma, advi_config, seeds, device, fallback_log_path
     )
+
+    max_saturation = diagnostics.get("max_clamp_saturation_fraction", 0.0)
+    if max_saturation > CLAMP_SATURATION_REPORT_FRACTION:
+        append_fallback_log(
+            {
+                "reason": "log_var_clamp_saturation",
+                "max_clamp_saturation_fraction": max_saturation,
+                "threshold": CLAMP_SATURATION_REPORT_FRACTION,
+                "n_log_joint_evals": diagnostics.get("n_log_joint_evals", 0),
+                "detail": (
+                    "log_var hit the +/-30 clamp in a large fraction of "
+                    "(timestep, state) cells; those cells have zero gradient, "
+                    "so ADVI saw a flat plateau instead of a divergence"
+                ),
+            },
+            fallback_log_path,
+        )
+    return posterior
 
 
 def sample_ms_egarch_draw(

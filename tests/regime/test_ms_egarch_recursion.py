@@ -3,6 +3,7 @@ from raemf_mc.regime.ms_egarch import (
     MSEGARCHParams,
     run_ms_egarch_recursion,
     expected_abs_standardized_t,
+    default_recursion_init,
 )
 
 
@@ -128,3 +129,47 @@ def test_forward_filter_is_causal_prefix_invariant():
         result_short["log_filtered_prob"], result_long["log_filtered_prob"][:T], atol=1e-6
     )
     assert torch.allclose(result_short["log_var"], result_long["log_var"][:T], atol=1e-6)
+
+
+def test_clamp_saturation_fraction_is_zero_for_well_behaved_params():
+    torch.manual_seed(4)
+    T, n = 30, 4
+    returns = torch.randn(T) * 0.01
+    params = MSEGARCHParams(
+        omega=torch.full((n,), -0.1),
+        alpha=torch.full((n,), 0.1),
+        beta=torch.full((n,), 0.9),
+        gamma=torch.full((n,), -0.05),
+        transition_logits=torch.zeros(n, n - 1),
+        nu_raw=torch.tensor(2.0),
+    )
+    init_log_var, init_log_state_prob = default_recursion_init()
+    result = run_ms_egarch_recursion(returns, params, init_log_var, init_log_state_prob)
+    assert result["clamp_saturation_fraction"] == 0.0
+
+
+def test_clamp_saturation_fraction_reports_explosive_recursion():
+    """The clamp keeps an explosive beta from producing NaN, but a clamped
+    cell has zero gradient — ADVI sees a flat plateau, not an error. The
+    fraction is the only signal that this happened at all."""
+    torch.manual_seed(5)
+    T, n = 40, 4
+    returns = torch.randn(T) * 0.01
+    params = MSEGARCHParams(
+        omega=torch.full((n,), 2.0),
+        alpha=torch.full((n,), 0.1),
+        beta=torch.full((n,), 2.5),  # |beta| > 1 -> non-stationary
+        gamma=torch.full((n,), 0.0),
+        transition_logits=torch.zeros(n, n - 1),
+        nu_raw=torch.tensor(2.0),
+    )
+    init_log_var, init_log_state_prob = default_recursion_init()
+    result = run_ms_egarch_recursion(returns, params, init_log_var, init_log_state_prob)
+    assert result["clamp_saturation_fraction"] > 0.5
+    assert torch.isfinite(result["log_var"]).all()
+
+
+def test_default_recursion_init_is_unit_variance_and_uniform_states():
+    init_log_var, init_log_state_prob = default_recursion_init()
+    assert torch.equal(init_log_var, torch.zeros(4))
+    assert torch.allclose(torch.exp(init_log_state_prob), torch.full((4,), 0.25))

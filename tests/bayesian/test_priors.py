@@ -49,3 +49,23 @@ def test_hierarchical_prior_config_defaults():
     config = HierarchicalPriorConfig()
     assert config.hyper_mean_scale == 1.0
     assert config.min_effective_observations == 30.0
+
+
+def test_shrinkage_threshold_scales_with_window_length():
+    config = HierarchicalPriorConfig()
+    # Short window: the absolute floor binds.
+    assert config.shrinkage_threshold(200) == 30.0
+    # Full series: the fraction binds, so the mechanism keeps working at
+    # scale instead of pinning every weight to exactly 1.0.
+    assert config.shrinkage_threshold(6264) == 0.05 * 6264
+
+
+def test_shrinkage_activates_for_under_occupied_regime_at_full_series_length():
+    config = HierarchicalPriorConfig()
+    threshold = config.shrinkage_threshold(6264)
+    # occupancies for a well-used regime vs one holding ~1.6% of the series
+    effective_obs = torch.tensor([2000.0, 100.0])
+    weight = state_shrinkage_weight(effective_obs, threshold)
+    assert weight[0] == 1.0
+    assert weight[1] < 1.0  # this was pinned at 1.0 under the old fixed 30.0
+    assert state_shrinkage_weight(effective_obs, 30.0)[1] == 1.0

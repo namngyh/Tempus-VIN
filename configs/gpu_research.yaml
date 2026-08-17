@@ -17,3 +17,4 @@ advi:
 prior:
   hyper_mean_scale: 1.0
   min_effective_observations: 30.0
+  min_effective_fraction: 0.05   # regime chiem duoi 5% occupancy -> shrinkage that su
