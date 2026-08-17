@@ -231,6 +231,38 @@ def fit_mean_field_advi(
 class PooledPosterior:
     seed_results: list[FitResult]
 
+    @property
+    def n_fallback_seeds(self) -> int:
+        """How many pooled seeds ended on the fallback path.
+
+        Pooling stays equal-weight over ALL seeds — dropping the unhealthy
+        ones would be cherry-picking, which the project explicitly forbids.
+        But a pooled posterior where half the seeds fell back is a very
+        different object from one where none did, and that distinction was
+        previously invisible to every consumer of the pool. Exposing it lets
+        callers log/report it without changing the sampling behaviour.
+        """
+        return sum(1 for r in self.seed_results if r.fallback_used)
+
+    @property
+    def fallback_fraction(self) -> float:
+        if not self.seed_results:
+            return 0.0
+        return self.n_fallback_seeds / len(self.seed_results)
+
+    def fallback_summary(self) -> dict:
+        """Loggable snapshot of pool health, including per-seed reasons."""
+        return {
+            "n_seeds": len(self.seed_results),
+            "n_fallback_seeds": self.n_fallback_seeds,
+            "fallback_fraction": self.fallback_fraction,
+            "fallback_seeds": [
+                {"seed": r.seed, "reason": r.fallback_reason, "n_retries": r.n_retries}
+                for r in self.seed_results
+                if r.fallback_used
+            ],
+        }
+
 
 def fit_multi_seed_advi(
     log_joint_fn: Callable[[torch.Tensor], torch.Tensor],
@@ -249,7 +281,15 @@ def fit_multi_seed_advi(
         )
         for seed in seeds
     ]
-    return PooledPosterior(seed_results=results)
+    posterior = PooledPosterior(seed_results=results)
+    if posterior.n_fallback_seeds:
+        # Pool composition stays equal-weight (no cherry-picking), but a pool
+        # containing fallback seeds must not look identical to a healthy one.
+        append_fallback_log(
+            {"reason": "pooled_posterior_contains_fallback_seeds", **posterior.fallback_summary()},
+            fallback_log_path,
+        )
+    return posterior
 
 
 def sample_joint_draw(
