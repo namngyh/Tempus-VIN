@@ -1,4 +1,3 @@
-import numpy as np
 import pandas as pd
 from raemf_mc.validation.purged_split import target_end_dates, purged_train_mask
 

@@ -6,7 +6,6 @@ from raemf_mc.data.ingest import (
     drop_exact_duplicates,
     validate_ohlc_invariants,
     clean_vnindex_data,
-    DroppedRow,
 )
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "vnindex_sample.csv"

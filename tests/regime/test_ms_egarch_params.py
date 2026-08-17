@@ -2,7 +2,6 @@ import math
 import torch
 from scipy import stats
 from raemf_mc.regime.ms_egarch import (
-    N_STATES,
     MSEGARCHParamLayout,
     unpack_params,
     transition_matrix,
