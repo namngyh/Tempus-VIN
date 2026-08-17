@@ -176,3 +176,44 @@ def fit_mean_field_advi(
         n_retries=n_retries,
         seed=seed,
     )
+
+
+@dataclass
+class PooledPosterior:
+    seed_results: list[FitResult]
+
+
+def fit_multi_seed_advi(
+    log_joint_fn: Callable[[torch.Tensor], torch.Tensor],
+    init_mu: torch.Tensor,
+    init_log_sigma: torch.Tensor,
+    config: AdviConfig,
+    seeds: list[int],
+    device: torch.device,
+    fallback_log_path: str | Path = "fallbacks.json",
+) -> PooledPosterior:
+    """Fit one mean-field posterior per seed and pool them as an
+    equal-weight mixture — never keep only the best-ELBO seed."""
+    results = [
+        fit_mean_field_advi(
+            log_joint_fn, init_mu, init_log_sigma, config, seed, device, fallback_log_path
+        )
+        for seed in seeds
+    ]
+    return PooledPosterior(seed_results=results)
+
+
+def sample_joint_draw(
+    posterior: PooledPosterior, generator: torch.Generator | None = None
+) -> torch.Tensor:
+    """Draw exactly one flat theta vector from the pooled posterior: pick
+    one seed uniformly at random, then reparameterize-sample once from
+    that seed's mean-field Gaussian. The caller is responsible for
+    reusing the returned tensor for an entire Monte Carlo path rather
+    than resampling at each horizon step — this function performs no
+    caching itself."""
+    n_seeds = len(posterior.seed_results)
+    idx = int(torch.randint(n_seeds, (1,), generator=generator).item())
+    fr = posterior.seed_results[idx]
+    eps = torch.randn(fr.mu.shape, generator=generator)
+    return fr.mu + torch.exp(fr.log_sigma) * eps
