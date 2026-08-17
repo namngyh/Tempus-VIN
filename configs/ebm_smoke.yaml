@@ -1,0 +1,23 @@
+# Profile debug nhanh cho EBM: cua so du lieu ngan hon toan bo, it buoc ADVI,
+# 1 seed cho MS-EGARCH, it draw cho dac trung bat dinh. Dung de lap nhanh.
+device_preference: auto
+window_sessions: 1500      # ~6 nam gan nhat, du de co ca 4 regime
+train_frac: 0.7
+val_frac: 0.15
+n_posterior_draws: 20
+seeds: [0]
+advi:
+  n_steps: 300
+  learning_rate: 0.05
+  warmup_steps: 20
+  grad_clip_norm: 10.0
+  elbo_ma_window: 20
+  early_stop_patience: 100
+  min_delta: 0.001
+  retry_lr_factor: 0.5
+  max_retries: 3
+  n_mc_samples: 4
+prior:
+  hyper_mean_scale: 1.0
+  min_effective_observations: 30.0
+  min_effective_fraction: 0.05
