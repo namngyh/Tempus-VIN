@@ -117,3 +117,71 @@ def student_t_log_pdf_with_variance(
     Var(X) = scale^2 * nu / (nu - 2)."""
     scale = torch.sqrt(variance * (nu - 2) / nu)
     return _student_t_log_pdf(x, loc, scale, nu)
+
+
+def run_ms_egarch_recursion(
+    returns: torch.Tensor,
+    params: MSEGARCHParams,
+    init_log_var: torch.Tensor,
+    init_log_state_prob: torch.Tensor,
+) -> dict:
+    """Gray's-collapsing MS-EGARCH recursion fused with a causal Hamilton
+    forward filter, entirely in log-domain for numerical stability.
+
+    `returns` must already be centered (MS-EGARCH models the innovation
+    process, not the conditional mean).
+    """
+    T = returns.shape[0]
+    n = params.omega.shape[0]
+    trans = transition_matrix(params.transition_logits)
+    log_trans = torch.log(trans + 1e-12)
+    nu = nu_from_raw(params.nu_raw)
+    e_abs_z = expected_abs_standardized_t(nu)
+
+    log_var = torch.zeros(T, n, dtype=returns.dtype, device=returns.device)
+    log_filtered = torch.zeros(T, n, dtype=returns.dtype, device=returns.device)
+    log_var_bar = torch.zeros(T, dtype=returns.dtype, device=returns.device)
+
+    log_var_bar_prev = torch.logsumexp(init_log_state_prob + init_log_var, dim=0)
+    log_filt_prev = init_log_state_prob
+    z_prev = torch.zeros((), dtype=returns.dtype, device=returns.device)
+    total_log_lik = torch.zeros((), dtype=returns.dtype, device=returns.device)
+
+    for t in range(T):
+        log_var_t = (
+            params.omega
+            + params.beta * log_var_bar_prev
+            + params.alpha * (torch.abs(z_prev) - e_abs_z)
+            + params.gamma * z_prev
+        )
+        log_var[t] = log_var_t
+
+        # Hamilton predict step: log P(S_t=k | F_{t-1})
+        log_pred = torch.logsumexp(log_trans + log_filt_prev.unsqueeze(1), dim=0)
+
+        variance_t = torch.exp(log_var_t)
+        loglik_t = student_t_log_pdf_with_variance(
+            returns[t], torch.zeros_like(variance_t), variance_t, nu
+        )
+        log_joint_t = log_pred + loglik_t
+        log_norm = torch.logsumexp(log_joint_t, dim=0)
+        total_log_lik = total_log_lik + log_norm
+
+        log_filt_t = log_joint_t - log_norm
+        log_filtered[t] = log_filt_t
+
+        log_var_bar_t = torch.logsumexp(log_filt_t + log_var_t, dim=0)
+        log_var_bar[t] = log_var_bar_t
+
+        sigma_bar_t = torch.exp(0.5 * log_var_bar_t)
+        z_prev = returns[t] / sigma_bar_t
+        log_var_bar_prev = log_var_bar_t
+        log_filt_prev = log_filt_t
+
+    return {
+        "log_var": log_var,
+        "log_filtered_prob": log_filtered,
+        "log_var_bar": log_var_bar,
+        "total_log_lik": total_log_lik,
+        "nu": nu,
+    }
