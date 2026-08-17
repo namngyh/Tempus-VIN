@@ -37,3 +37,19 @@ def test_apply_alignment_reorders_columns():
     reordered = apply_alignment(log_filtered_prob, permutation)
     expected = torch.tensor([[0.3, 0.1, 0.4, 0.2]]).log()
     assert torch.allclose(reordered, expected, atol=1e-6)
+
+
+def test_align_states_handles_a_state_with_no_probability_mass():
+    """A state that never activates has ~zero total mass; normalizing by it
+    must not produce NaN and silently scramble the ordering."""
+    torch.manual_seed(2)
+    T = 300
+    returns = torch.cat([torch.randn(T) * 0.005 + 0.002, torch.randn(T) * 0.02 - 0.005])
+    log_filtered_prob = torch.full((2 * T, 4), -80.0)
+    log_filtered_prob[:T, 0] = 0.0
+    log_filtered_prob[T:, 1] = 0.0
+    # states 2 and 3 keep essentially zero mass everywhere
+
+    permutation = align_states(returns, log_filtered_prob)
+    assert sorted(permutation) == [0, 1, 2, 3]
+    assert permutation.index(0) < permutation.index(1)
