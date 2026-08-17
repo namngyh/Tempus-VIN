@@ -28,7 +28,12 @@ class FitResult:
     mu: torch.Tensor
     log_sigma: torch.Tensor
     elbo_trace: list[float]
-    converged: bool
+    # NOT a convergence claim. True means only "the attempt ran to completion
+    # without hitting a non-finite loss or a raising log_joint" — the ELBO may
+    # still be nowhere near a stationary point. Assessing actual convergence is
+    # the job of the ELBO trace and the seed-stability diagnostics. This field
+    # was called `converged`, which read as a guarantee it never made.
+    completed_without_divergence: bool
     fallback_used: bool
     fallback_reason: str | None
     n_retries: int
@@ -179,11 +184,11 @@ def fit_mean_field_advi(
     n_retries = 0
     fallback_used = False
     fallback_reason = None
-    mu, log_sigma, elbo_trace, converged, failure_reason = _single_attempt(
+    mu, log_sigma, elbo_trace, completed_without_divergence, failure_reason = _single_attempt(
         log_joint_fn, init_mu, init_log_sigma, config, seed, device, lr
     )
 
-    while not converged and n_retries < config.max_retries:
+    while not completed_without_divergence and n_retries < config.max_retries:
         n_retries += 1
         lr = lr * config.retry_lr_factor
         event = {
@@ -193,11 +198,11 @@ def fit_mean_field_advi(
             "reason": failure_reason or "elbo_diverged_nan_or_inf",
         }
         append_fallback_log(event, fallback_log_path)
-        mu, log_sigma, elbo_trace, converged, failure_reason = _single_attempt(
+        mu, log_sigma, elbo_trace, completed_without_divergence, failure_reason = _single_attempt(
             log_joint_fn, init_mu, init_log_sigma, config, seed, device, lr
         )
 
-    if not converged:
+    if not completed_without_divergence:
         fallback_used = True
         fallback_reason = "exhausted_retries_reverted_to_last_finite_step"
         append_fallback_log(
@@ -214,7 +219,7 @@ def fit_mean_field_advi(
         mu=mu,
         log_sigma=log_sigma,
         elbo_trace=elbo_trace,
-        converged=converged,
+        completed_without_divergence=completed_without_divergence,
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
         n_retries=n_retries,

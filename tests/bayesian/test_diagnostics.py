@@ -14,7 +14,7 @@ def test_summarize_elbo_trace_reports_final_and_best():
 def test_seed_stability_metrics_zero_for_identical_seeds():
     results = [
         FitResult(mu=torch.zeros(2), log_sigma=torch.zeros(2), elbo_trace=[-1.0, -1.0],
-                   converged=True, fallback_used=False, fallback_reason=None, n_retries=0, seed=s)
+                   completed_without_divergence=True, fallback_used=False, fallback_reason=None, n_retries=0, seed=s)
         for s in range(3)
     ]
     metrics = seed_stability_metrics(results)
@@ -25,9 +25,9 @@ def test_seed_stability_metrics_zero_for_identical_seeds():
 def test_seed_stability_metrics_nonzero_for_divergent_seeds():
     results = [
         FitResult(mu=torch.zeros(2), log_sigma=torch.zeros(2), elbo_trace=[-1.0],
-                   converged=True, fallback_used=False, fallback_reason=None, n_retries=0, seed=0),
+                   completed_without_divergence=True, fallback_used=False, fallback_reason=None, n_retries=0, seed=0),
         FitResult(mu=torch.ones(2) * 5, log_sigma=torch.zeros(2), elbo_trace=[-9.0],
-                   converged=True, fallback_used=False, fallback_reason=None, n_retries=0, seed=1),
+                   completed_without_divergence=True, fallback_used=False, fallback_reason=None, n_retries=0, seed=1),
     ]
     metrics = seed_stability_metrics(results)
     assert metrics["final_elbo_std"] > 0.0
