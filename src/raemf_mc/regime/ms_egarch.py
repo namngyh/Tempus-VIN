@@ -20,6 +20,22 @@ from raemf_mc.bayesian.torch_backend import (
 
 N_STATES = 4
 
+# Bound on |log_var_t| enforced every recursion step. The EGARCH log-variance
+# recursion has no built-in stationarity constraint (unlike GARCH, beta_k is
+# free to exceed 1 in absolute value in this unconstrained ADVI parameter
+# space), so a single explored theta can compound exponentially over a long
+# `returns` series (T in the hundreds) and drive log_var_t far enough from 0
+# that `exp(log_var_t)` underflows to exactly 0.0 or overflows to inf in
+# float32. Both are silent in the forward pass but poison the backward pass:
+# the recursion divides by sigma_bar_t (`z_prev = returns[t] / sigma_bar_t`)
+# and by scale in the Student-t log-density, and d/dx sqrt(x) and d/dx (a/x)
+# are singular at x=0, so a literal zero variance produces a NaN gradient
+# even though the forward loss value can still look finite that step. This
+# clamp keeps variance within [exp(-30), exp(30)] ~= [9e-14, 1e13], far
+# inside float32's safe range in both directions, so every division in the
+# recursion stays well-conditioned regardless of what ADVI samples.
+_LOG_VAR_CLAMP = 30.0
+
 
 @dataclass(frozen=True)
 class MSEGARCHParamLayout:
@@ -167,6 +183,7 @@ def run_ms_egarch_recursion(
             + params.alpha * (torch.abs(z_prev) - e_abs_z)
             + params.gamma * z_prev
         )
+        log_var_t = torch.clamp(log_var_t, min=-_LOG_VAR_CLAMP, max=_LOG_VAR_CLAMP)
         log_var[t] = log_var_t
 
         # Hamilton predict step: log P(S_t=k | F_{t-1})
