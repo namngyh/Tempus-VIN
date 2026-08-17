@@ -215,5 +215,5 @@ def sample_joint_draw(
     n_seeds = len(posterior.seed_results)
     idx = int(torch.randint(n_seeds, (1,), generator=generator).item())
     fr = posterior.seed_results[idx]
-    eps = torch.randn(fr.mu.shape, generator=generator)
+    eps = torch.randn(fr.mu.shape, generator=generator, device=fr.mu.device)
     return fr.mu + torch.exp(fr.log_sigma) * eps
