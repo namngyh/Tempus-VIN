@@ -183,6 +183,17 @@ với mỗi outer fold, mọi hàng dùng để fit (kể cả forward filter c�
 có ngày kết thúc target nhỏ hơn boundary của fold đó. `leakage_checks.py` cung cấp
 hàm assertion dùng chung: `assert_no_target_leakage(df, boundary, horizon)`.
 
+**Phạm vi thực tế của sub-project này (ghi rõ để không bị hiểu nhầm là đã xong):**
+`purged_split.py` và `leakage_checks.py` được xây và test độc lập, nhưng **chưa hề
+được ghép nối với vòng fit MS-EGARCH ở bất kỳ đâu**. Integration test
+(`tests/test_integration_smoke.py`) fit trên một cửa sổ dữ liệu liền mạch, không có
+purge boundary, không tách train/test, và state alignment trong test đó chạy trên
+chính cửa sổ đã fit chứ không phải trên phần train riêng biệt. Nói cách khác,
+chuỗi ingest → purged split → fit → alignment-chỉ-trên-train **chưa có test hay
+assertion nào kiểm chứng đầu-cuối**. Việc orchestrate toàn bộ pipeline (bao gồm
+walk-forward theo fold và tách train/test thật) được **hoãn sang sub-project sau**
+theo đúng kế hoạch, không nằm trong phạm vi nhánh này.
+
 ## 6. Hạ tầng VB dùng chung (`bayesian/torch_backend.py`)
 
 - Reparameterization gradient cho biến phân Gaussian mean-field (mọi tham số
@@ -287,14 +298,52 @@ thành Bull/Sideway/Bear/Stress dựa trên mean return, volatility trung bình,
 duration kỳ vọng của từng trạng thái — permutation cố định áp dụng lại cho toàn bộ
 dữ liệu (bao gồm cả validation/test), không refit trên test.
 
+Trạng thái triển khai thực tế (đính chính sau review): mean return và volatility
+được **chuẩn hoá z-score trên 4 trạng thái** trước khi cộng vào score. Trước đó
+hai đại lượng được trừ trực tiếp cho nhau dù khác thang đo tự nhiên (mean return
+cỡ 1e-3, volatility cỡ 1e-2), nên trên thực tế score bị volatility chi phối gần
+như hoàn toàn. **Tiêu chí duration nêu trong đoạn trên vẫn CHƯA được triển khai**
+— nó đòi hỏi truyền `MSEGARCHParams`/ma trận transition vào một hàm hiện chỉ nhận
+`returns` và `log_filtered_prob`, là một thay đổi interface thật sự, nên được hoãn
+có chủ ý (đã ghi chú ngay trong docstring của `align_states`).
+
 ## 9. Hierarchical shrinkage prior
 
-Regime Stress dự kiến có rất ít quan sát trong ~6.306 phiên. Áp prior phân cấp
+Regime Stress dự kiến có rất ít quan sát trong ~6.264 phiên. Áp prior phân cấp
 cho (ω, α, β, γ) của từng trạng thái: mỗi tham số trạng thái có phân phối quanh
 một "hyper-mean" toàn cục dùng chung, độ co dãn (shrinkage) về hyper-mean tỷ lệ
 nghịch với effective-observation-count ước lượng của trạng thái đó (đếm qua tổng
 xác suất filtered của trạng thái trên tập train) — trạng thái ít quan sát bị kéo
 về gần tham số trung bình toàn cục hơn, tránh overfit vào vài chục phiên hiếm gặp.
+
+Ba điều chỉnh sau vòng review toàn nhánh (chi tiết lý do nằm trong comment code):
+
+- **Ngưỡng effective-observation phải co giãn theo độ dài cửa sổ.** Ngưỡng tuyệt
+  đối cố định (30 quan sát) không bao giờ kích hoạt trên dữ liệu thật: với 500
+  (smoke) đến 6.264 (full) phiên chia cho 4 trạng thái, mọi regime đều vượt xa 30,
+  nên trọng số shrinkage luôn đúng bằng 1.0 và **cơ chế phân cấp — tính năng chủ
+  đạo của mục này — chưa từng hoạt động một lần nào**. Nay ngưỡng là
+  `max(min_effective_observations, min_effective_fraction × T)` với
+  `min_effective_fraction = 0.05`: regime chiếm dưới 5% occupancy bị co thật, ở
+  mọi cỡ mẫu.
+- **Cần thêm prior cho chính hyper-mean.** Riêng tầng phân cấp chỉ phạt *độ phân
+  tán* giữa 4 trạng thái nên bất biến với phép tịnh tiến: cộng cùng một hằng số
+  vào cả 4 giá trị β không tốn gì, tức **không có gì ràng buộc mức của β** và β > 1
+  (không dừng, bùng nổ) hoàn toàn tự do. Nay mỗi họ tham số có thêm prior mức trên
+  hyper-mean, trong đó β được center tại 0,9 với scale 0,15 — vùng 0,85–0,99 thực
+  tế nằm gọn trong ~0,7 sd còn vùng bùng nổ bị phạt.
+- **effective_obs được `.detach()`.** Trước đó gradient chảy ngược qua
+  effective_obs vào hằng số chuẩn hoá của prior, biến "prior" thành hàm của θ và
+  tạo động lực gradient để mô hình **bóp chết occupancy của một regime chỉ nhằm
+  làm nhẹ chính phần phạt prior của regime đó**. Occupancy nay được xem là trọng
+  số cố định kiểu empirical-Bayes, không thuộc mô hình sinh được lấy đạo hàm.
+
+Hai prior "weakly-informative" ở §7 cũng được chỉnh vì thực chất chúng rất mạnh
+sau khi tính đến phép biến đổi: `Normal(0,1)` trên `nu_raw` kéo theo ν gần như
+không bao giờ vượt ~4,2 (ép kurtosis gần vô hạn) — nay là `Normal(5, 4)` để ν
+thực tế 5–15 nằm trong tầm; `Normal(0,1)` trên transition logits đặt khối lượng
+prior quanh **hàng transition đều** (p_stay = 0,25), khiến một regime "dính" thực
+tế (p_stay ≈ 0,95) nằm cách ~4 sd — nay center tại p_stay = 0,85 với scale 2,0.
 
 ## 10. Quyết định (c), (d) — ghi nhận cho sub-project sau
 
