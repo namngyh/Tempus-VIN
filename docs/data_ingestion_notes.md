@@ -1,12 +1,12 @@
-# Ghi chu lam sach du lieu VN-Index
+# Ghi chú làm sạch dữ liệu VN-Index
 
-Tong so dong parse duoc tu file goc: 6307
-So dong bi loai: 43
-So dong sach con lai: 6264
+Tổng số dòng parse được từ file gốc: 6307
+Số dòng bị loại: 43
+Số dòng sạch còn lại: 6264
 
-## Danh sach dong bi loai
+## Danh sách dòng bị loại
 
-| Dong (line) | Ngay | Ly do | Gia tri raw (O,H,L,C,V) |
+| Dòng (line) | Ngày | Lý do | Giá trị raw (O,H,L,C,V) |
 |---|---|---|---|
 | 5921 | 2024-12-17 | exact_duplicate_of_previous_row | 1264.91, 1265.45, 1260.6, 1261.72, 358215808 |
 | 933 | 2004-12-10 | ohlc_invariant_violation | 229.6, 230.1, 230.1, 230.1, 510830 |

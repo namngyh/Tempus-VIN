@@ -1,7 +1,7 @@
-# Profile debug nhanh tren CPU: cua so du lieu ngan, it buoc ADVI, 1 seed.
-# Dung de kiem tra dung/sai truoc khi chay full-scale.
+# Profile debug nhanh trên CPU: cửa sổ dữ liệu ngắn, ít bước ADVI, 1 seed.
+# Dùng để kiểm tra đúng/sai trước khi chạy full-scale.
 device_preference: auto
-window_sessions: 500        # chi dung 500 phien gan nhat de lap nhanh
+window_sessions: 500        # chỉ dùng 500 phiên gần nhất để lặp nhanh
 seeds: [0]
 advi:
   n_steps: 300
@@ -17,4 +17,4 @@ advi:
 prior:
   hyper_mean_scale: 1.0
   min_effective_observations: 30.0
-  min_effective_fraction: 0.05   # regime chiem duoi 5% occupancy -> shrinkage that su
+  min_effective_fraction: 0.05   # regime chiếm dưới 5% occupancy -> shrinkage thật sự

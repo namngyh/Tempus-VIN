@@ -1,7 +1,7 @@
-# Profile debug nhanh cho EBM: cua so du lieu ngan hon toan bo, it buoc ADVI,
-# 1 seed cho MS-EGARCH, it draw cho dac trung bat dinh. Dung de lap nhanh.
+# Profile debug nhanh cho EBM: cửa sổ dữ liệu ngắn hơn toàn bộ, ít bước ADVI,
+# 1 seed cho MS-EGARCH, ít draw cho đặc trưng bất định. Dùng để lặp nhanh.
 device_preference: auto
-window_sessions: 1500      # ~6 nam gan nhat, du de co ca 4 regime
+window_sessions: 1500      # ~6 năm gần nhất, đủ để có cả 4 regime
 train_frac: 0.7
 val_frac: 0.15
 n_posterior_draws: 20

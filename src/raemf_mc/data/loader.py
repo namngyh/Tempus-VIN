@@ -38,15 +38,15 @@ def write_ingestion_notes(
     """Write a human-readable Markdown log of every dropped row and why."""
     output_path = Path(output_path)
     lines = [
-        "# Ghi chu lam sach du lieu VN-Index",
+        "# Ghi chú làm sạch dữ liệu VN-Index",
         "",
-        f"Tong so dong parse duoc tu file goc: {total_parsed}",
-        f"So dong bi loai: {len(dropped)}",
-        f"So dong sach con lai: {final_count}",
+        f"Tổng số dòng parse được từ file gốc: {total_parsed}",
+        f"Số dòng bị loại: {len(dropped)}",
+        f"Số dòng sạch còn lại: {final_count}",
         "",
-        "## Danh sach dong bi loai",
+        "## Danh sách dòng bị loại",
         "",
-        "| Dong (line) | Ngay | Ly do | Gia tri raw (O,H,L,C,V) |",
+        "| Dòng (line) | Ngày | Lý do | Giá trị raw (O,H,L,C,V) |",
         "|---|---|---|---|",
     ]
     for d in dropped:

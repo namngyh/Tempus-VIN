@@ -1,7 +1,7 @@
-# Profile scale-up nhieu seed/nhieu buoc ADVI cho may co CUDA.
-# Chua chay - chuan bi san de dung khi chuyen sang may co GPU.
+# Profile scale-up nhiều seed/nhiều bước ADVI cho máy có CUDA.
+# Chưa chạy - chuẩn bị sẵn để dùng khi chuyển sang máy có GPU.
 device_preference: auto
-window_sessions: null        # dung toan bo chuoi du lieu da lam sach
+window_sessions: null        # dùng toàn bộ chuỗi dữ liệu đã làm sạch
 seeds: [0, 1, 2, 3, 4, 5, 6, 7]
 advi:
   n_steps: 20000
@@ -17,4 +17,4 @@ advi:
 prior:
   hyper_mean_scale: 1.0
   min_effective_observations: 30.0
-  min_effective_fraction: 0.05   # regime chiem duoi 5% occupancy -> shrinkage that su
+  min_effective_fraction: 0.05   # regime chiếm dưới 5% occupancy -> shrinkage thật sự
