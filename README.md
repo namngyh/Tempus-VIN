@@ -48,10 +48,12 @@ mục "Trạng thái hiện tại" dưới đây để biết chính xác test n
 
 Cả 7 task đã xong và review sạch (spec + code quality từng task). Whole-branch
 review (Opus) tìm ra 1 lỗi Critical + 3 Important + vài Minor — **đã fix hết**,
-commit cuối `b68b492` trên branch `scenario-mc-var`. Chi tiết đầy đủ trong
-`.worktrees/scenario-mc-var/.superpowers/sdd/2026-08-18-scenario-mc-var/progress.md`
-(ledger — nếu worktree còn tồn tại; nếu đã bị xóa thì git log của branch là bản
-ghi chính xác).
+commit cuối `6c5efe3` trên branch `scenario-mc-var`. Chi tiết đầy đủ (toàn bộ
+ledger — mọi ruling, finding, và báo cáo điều tra root-cause của lỗi nổ số
+học EGARCH) đã được lưu vào **`docs/sdd-records/` trên chính branch này**
+(`scenario-mc-var-ledger.md`, `scenario-mc-var-task6-debug-report.md`) — đây
+là bản sao đã commit, khác với thư mục làm việc gốc `.superpowers/sdd/` vốn
+bị `.gitignore` loại bỏ hoàn toàn nên KHÔNG theo git khi clone máy khác.
 
 **Việc còn thiếu trước khi merge** (dừng lại đúng lúc này):
 
@@ -103,8 +105,10 @@ trên branch `scenario-mc-var`**, chưa có trên `master`. Vì vậy:
    pip install -e . --no-deps
    ```
 3. Tiếp tục plan từ Task 1 (dùng skill `subagent-driven-development`, đọc lại
-   `docs/superpowers/plans/2026-08-18-evaluation-model-card.md` và ledger tại
-   `.worktrees/evaluation-model-card/.superpowers/sdd/2026-08-18-evaluation-model-card/progress.md`).
+   `docs/superpowers/plans/2026-08-18-evaluation-model-card.md`). Chưa có
+   task nào hoàn thành ở sub-project này nên không có ledger nào cần khôi
+   phục — bắt đầu từ đầu theo đúng plan là đủ (khác với sub-project 3 ở
+   trên, nơi đã có nhiều task xong và ledger được lưu riêng vì lý do đó).
    Task 1-3, 5, 7 (metric phân loại, CRPS/WIS, Kupiec, config file, model card)
    không phụ thuộc sub-project 3 nên có thể làm trước bước merge ở trên nếu
    muốn — chỉ Task 4/6 (walk-forward harness + integration test) cần code của
