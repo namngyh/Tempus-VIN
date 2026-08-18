@@ -5,6 +5,7 @@ import torch
 from raemf_mc.bayesian.torch_backend import PooledPosterior, sample_joint_draw
 from raemf_mc.regime.ms_egarch import (
     MSEGARCHParamLayout,
+    MSEGARCHParams,
     expected_abs_standardized_t,
     nu_from_raw,
     run_ms_egarch_recursion,
@@ -53,11 +54,23 @@ def simulate_mc_paths(
     init_log_state_prob = (
         init_log_state_prob.to(device) if device is not None else init_log_state_prob
     )
-    daily_returns = torch.zeros(n_paths, horizon, dtype=centered_returns.dtype, device=device)
+    daily_returns = torch.zeros(
+        n_paths, horizon, dtype=centered_returns.dtype, device=centered_returns.device
+    )
 
     for p in range(n_paths):
         params = sample_ms_egarch_draw(ms_egarch_posterior, layout, generator=generator)
         mu = sample_joint_draw(mu_posterior, generator=generator)
+        if device is not None:
+            params = MSEGARCHParams(
+                omega=params.omega.to(device),
+                alpha=params.alpha.to(device),
+                beta=params.beta.to(device),
+                gamma=params.gamma.to(device),
+                transition_logits=params.transition_logits.to(device),
+                nu_raw=params.nu_raw.to(device),
+            )
+            mu = mu.to(device)
         trans = transition_matrix(params.transition_logits)
         nu = nu_from_raw(params.nu_raw)
         e_abs_z = expected_abs_standardized_t(nu)

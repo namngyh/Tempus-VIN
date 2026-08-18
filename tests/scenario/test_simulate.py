@@ -84,3 +84,39 @@ def test_simulate_mc_paths_degenerate_single_state_no_crash_and_finite():
     )
     assert paths.shape == (5, 10)
     assert torch.isfinite(paths).all()
+
+
+def test_simulate_mc_paths_honors_explicit_device_argument():
+    """Regression guard for two device-allocation bugs: (1) daily_returns
+    used to be allocated with the raw `device` kwarg instead of
+    centered_returns.device, and (2) posterior-sampled params/mu never
+    moved to an explicitly-requested device. This test passes an explicit
+    device=torch.device("cpu") (the only device available in this
+    environment) so both previously-buggy code paths execute, and checks
+    the result is on that device and matches the device=None result
+    (since everything here is already CPU-resident, moving to "cpu" is a
+    no-op numerically -- this only guards the code path, not cross-device
+    correctness, which cannot be exercised without a GPU)."""
+    layout = MSEGARCHParamLayout()
+    theta = torch.zeros(layout.total)
+    theta[2 * layout.n_states : 3 * layout.n_states] = -1.0
+    theta[-1] = 3.0
+    ms_posterior = _fake_posterior(theta)
+    mu_posterior = _fake_posterior(torch.tensor([0.001, -0.001, 0.0, -0.002]))
+
+    torch.manual_seed(11)
+    centered_returns = torch.randn(50) * 0.01
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    paths_explicit = simulate_mc_paths(
+        ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
+        n_paths=10, horizon=5, layout=layout, device=torch.device("cpu"),
+        generator=torch.Generator().manual_seed(13),
+    )
+    paths_default = simulate_mc_paths(
+        ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
+        n_paths=10, horizon=5, layout=layout, device=None,
+        generator=torch.Generator().manual_seed(13),
+    )
+    assert paths_explicit.device == centered_returns.device
+    torch.testing.assert_close(paths_explicit, paths_default)
