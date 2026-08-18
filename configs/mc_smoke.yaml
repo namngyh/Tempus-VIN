@@ -1,7 +1,7 @@
 # configs/mc_smoke.yaml
-# Profile debug nhanh cho scenario-return + Monte Carlo: cua so ngan, it
-# buoc ADVI, quy mo Monte Carlo nho (500 path) - dung de kiem chung logic
-# dung, KHONG phai so lieu VaR/CVaR nghien cuu cuoi cung.
+# Profile debug nhanh cho scenario-return + Monte Carlo: cửa sổ ngắn, ít
+# bước ADVI, quy mô Monte Carlo nhỏ (500 path) - dùng để kiểm chứng logic
+# đúng, KHÔNG phải số liệu VaR/CVaR nghiên cứu cuối cùng.
 device_preference: auto
 window_sessions: 1500
 seeds: [0]
