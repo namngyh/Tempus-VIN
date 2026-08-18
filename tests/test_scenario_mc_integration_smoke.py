@@ -65,6 +65,7 @@ def test_scenario_mc_pipeline_end_to_end_on_real_data(tmp_path):
         ms_egarch_posterior, mu_posterior, returns_tensor, init_log_var, init_log_state_prob,
         n_paths=config["mc_n_paths"], horizon=config["mc_horizon"], layout=layout,
         device=device, generator=mc_gen,
+        fallback_log_path=tmp_path / "mc_fallbacks.json",
     )
     assert daily_paths.shape == (config["mc_n_paths"], config["mc_horizon"])
     assert torch.isfinite(daily_paths).all()

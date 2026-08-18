@@ -14,7 +14,7 @@ def _fake_posterior(theta: torch.Tensor, log_sigma_value: float = -50.0) -> Pool
     return PooledPosterior(seed_results=[result])
 
 
-def test_simulate_mc_paths_shape_and_finiteness():
+def test_simulate_mc_paths_shape_and_finiteness(tmp_path):
     layout = MSEGARCHParamLayout()
     theta = torch.zeros(layout.total)
     theta[2 * layout.n_states : 3 * layout.n_states] = -1.0  # mild beta
@@ -30,12 +30,13 @@ def test_simulate_mc_paths_shape_and_finiteness():
     paths = simulate_mc_paths(
         ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
         n_paths=25, horizon=20, layout=layout, generator=gen,
+        fallback_log_path=tmp_path / "fallbacks.json",
     )
     assert paths.shape == (25, 20)
     assert torch.isfinite(paths).all()
 
 
-def test_simulate_mc_paths_reproducible_with_fixed_generator():
+def test_simulate_mc_paths_reproducible_with_fixed_generator(tmp_path):
     layout = MSEGARCHParamLayout()
     theta = torch.zeros(layout.total)
     theta[2 * layout.n_states : 3 * layout.n_states] = -1.0
@@ -50,15 +51,17 @@ def test_simulate_mc_paths_reproducible_with_fixed_generator():
     paths_1 = simulate_mc_paths(
         ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
         n_paths=10, horizon=5, layout=layout, generator=torch.Generator().manual_seed(42),
+        fallback_log_path=tmp_path / "fallbacks.json",
     )
     paths_2 = simulate_mc_paths(
         ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
         n_paths=10, horizon=5, layout=layout, generator=torch.Generator().manual_seed(42),
+        fallback_log_path=tmp_path / "fallbacks.json",
     )
     torch.testing.assert_close(paths_1, paths_2)
 
 
-def test_simulate_mc_paths_degenerate_single_state_no_crash_and_finite():
+def test_simulate_mc_paths_degenerate_single_state_no_crash_and_finite(tmp_path):
     """K=1 edge case: MSEGARCHParamLayout(n_states=1) gives
     transition_logits shape (1, 0), which exercises transition_matrix's
     reference-category softmax at its degenerate boundary (a single-column
@@ -81,12 +84,13 @@ def test_simulate_mc_paths_degenerate_single_state_no_crash_and_finite():
     paths = simulate_mc_paths(
         ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
         n_paths=5, horizon=10, layout=layout, generator=torch.Generator().manual_seed(9),
+        fallback_log_path=tmp_path / "fallbacks.json",
     )
     assert paths.shape == (5, 10)
     assert torch.isfinite(paths).all()
 
 
-def test_simulate_mc_paths_honors_explicit_device_argument():
+def test_simulate_mc_paths_honors_explicit_device_argument(tmp_path):
     """Regression guard for two device-allocation bugs: (1) daily_returns
     used to be allocated with the raw `device` kwarg instead of
     centered_returns.device, and (2) posterior-sampled params/mu never
@@ -112,11 +116,13 @@ def test_simulate_mc_paths_honors_explicit_device_argument():
         ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
         n_paths=10, horizon=5, layout=layout, device=torch.device("cpu"),
         generator=torch.Generator().manual_seed(13),
+        fallback_log_path=tmp_path / "fallbacks.json",
     )
     paths_default = simulate_mc_paths(
         ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
         n_paths=10, horizon=5, layout=layout, device=None,
         generator=torch.Generator().manual_seed(13),
+        fallback_log_path=tmp_path / "fallbacks.json",
     )
     assert paths_explicit.device == centered_returns.device
     torch.testing.assert_close(paths_explicit, paths_default)
