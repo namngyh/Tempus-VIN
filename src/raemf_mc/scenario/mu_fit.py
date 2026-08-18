@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Callable
 
 import torch
 
 from raemf_mc.bayesian.priors import hierarchical_normal_log_prob, state_shrinkage_weight
-from raemf_mc.bayesian.torch_backend import PooledPosterior
+from raemf_mc.bayesian.torch_backend import AdviConfig, PooledPosterior, fit_multi_seed_advi
 from raemf_mc.regime.ms_egarch import (
     MSEGARCHParamLayout,
     run_ms_egarch_recursion,
@@ -108,3 +109,37 @@ def build_mu_log_joint(
         return log_lik + log_prior
 
     return log_joint
+
+
+def fit_regime_mu(
+    centered_returns: torch.Tensor,
+    ms_egarch_posterior: PooledPosterior,
+    advi_config: AdviConfig,
+    seeds: list[int],
+    device: torch.device,
+    init_log_var: torch.Tensor,
+    init_log_state_prob: torch.Tensor,
+    layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
+    n_draws: int = 50,
+    mu_prior_scale: float = 0.01,
+    min_effective_observations: float = 30.0,
+    generator: torch.Generator | None = None,
+    fallback_log_path: str | Path = "fallbacks.json",
+) -> PooledPosterior:
+    """Fit mu_k's posterior via the shared generic ADVI engine, conditioned
+    on n_draws real MS-EGARCH posterior draws (see build_mu_log_joint)."""
+    centered_returns = centered_returns.to(device)
+    init_log_var = init_log_var.to(device)
+    init_log_state_prob = init_log_state_prob.to(device)
+    log_joint = build_mu_log_joint(
+        centered_returns, ms_egarch_posterior, init_log_var, init_log_state_prob,
+        layout=layout, n_draws=n_draws, mu_prior_scale=mu_prior_scale,
+        min_effective_observations=min_effective_observations, generator=generator,
+    )
+    init_mu = torch.zeros(layout.n_states, dtype=centered_returns.dtype, device=device)
+    init_log_sigma = torch.full(
+        (layout.n_states,), -1.0, dtype=centered_returns.dtype, device=device
+    )
+    return fit_multi_seed_advi(
+        log_joint, init_mu, init_log_sigma, advi_config, seeds, device, fallback_log_path
+    )

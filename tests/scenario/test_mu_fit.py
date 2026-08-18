@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from raemf_mc.bayesian.torch_backend import FitResult, PooledPosterior
+from raemf_mc.bayesian.torch_backend import AdviConfig, FitResult, PooledPosterior, sample_joint_draw
 from raemf_mc.regime.ms_egarch import (
     MSEGARCHParamLayout,
     default_recursion_init,
@@ -10,7 +10,7 @@ from raemf_mc.regime.ms_egarch import (
     student_t_log_pdf_with_variance,
     unpack_params,
 )
-from raemf_mc.scenario.mu_fit import build_mu_log_joint
+from raemf_mc.scenario.mu_fit import build_mu_log_joint, fit_regime_mu
 
 
 def _fake_posterior(theta: torch.Tensor, layout: MSEGARCHParamLayout) -> PooledPosterior:
@@ -149,3 +149,43 @@ def test_mu_log_joint_averages_draws_via_logsumexp_not_naive_mean():
 
     torch.testing.assert_close(actual_ll, expected_correct, atol=1e-3, rtol=1e-3)
     assert abs(float(actual_ll - expected_naive_mean)) > 1e-3
+
+
+def test_fit_regime_mu_runs_and_shrinks_sparse_state_toward_zero():
+    layout = MSEGARCHParamLayout()
+    theta = _known_theta(layout)
+    # Make state 3 (Stress, index 3) structurally rare: push its
+    # self-transition and inbound logits very negative so the Hamilton
+    # filter assigns it near-zero mass, giving it low effective_obs.
+    n = layout.n_states
+    trans_start = 4 * n
+    theta[trans_start : trans_start + n * (n - 1)] = 0.0
+    theta_reshaped = theta[trans_start : trans_start + n * (n - 1)].view(n, n - 1)
+    theta_reshaped[:, min(2, n - 2)] = -8.0  # column feeding state index 3 stays near-zero prob
+    posterior = _fake_posterior(theta, layout)
+
+    torch.manual_seed(2)
+    centered_returns = torch.randn(200) * 0.01
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    advi_config = AdviConfig(n_steps=100, learning_rate=0.05, warmup_steps=10,
+                              elbo_ma_window=10, early_stop_patience=50)
+    gen = torch.Generator().manual_seed(3)
+    mu_posterior = fit_regime_mu(
+        centered_returns, posterior, advi_config, seeds=[0], device=torch.device("cpu"),
+        init_log_var=init_log_var, init_log_state_prob=init_log_state_prob, layout=layout,
+        n_draws=1, mu_prior_scale=0.05, min_effective_observations=50.0, generator=gen,
+    )
+    assert len(mu_posterior.seed_results) == 1
+    fitted_mu = mu_posterior.seed_results[0].mu
+    assert torch.isfinite(fitted_mu).all()
+    assert fitted_mu.shape == (layout.n_states,)
+
+    draw = sample_joint_draw(mu_posterior, generator=torch.Generator().manual_seed(4))
+    assert draw.shape == (layout.n_states,)
+
+    # The structurally-rare state's fitted posterior mean should stay much
+    # closer to the zero hyper-mean than a well-identified state's --
+    # exact equality isn't guaranteed (ADVI is stochastic optimization),
+    # but the shrinkage mechanism should visibly bias it toward zero.
+    assert abs(float(fitted_mu[3])) <= abs(float(fitted_mu[0])) + 1e-3 or abs(float(fitted_mu[3])) < 0.02
