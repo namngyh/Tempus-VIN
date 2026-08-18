@@ -151,41 +151,98 @@ def test_mu_log_joint_averages_draws_via_logsumexp_not_naive_mean():
     assert abs(float(actual_ll - expected_naive_mean)) > 1e-3
 
 
-def test_fit_regime_mu_runs_and_shrinks_sparse_state_toward_zero():
-    layout = MSEGARCHParamLayout()
+def _rare_state_theta(layout: MSEGARCHParamLayout) -> torch.Tensor:
+    """`_known_theta` with state 3 (Stress, index 3) made structurally
+    rare: push the transition-logit column feeding it very negative so the
+    Hamilton filter assigns it near-zero mass, giving it low effective_obs
+    and thus (via `state_shrinkage_weight`) a tight, ~zero-centered prior."""
     theta = _known_theta(layout)
-    # Make state 3 (Stress, index 3) structurally rare: push its
-    # self-transition and inbound logits very negative so the Hamilton
-    # filter assigns it near-zero mass, giving it low effective_obs.
     n = layout.n_states
     trans_start = 4 * n
     theta[trans_start : trans_start + n * (n - 1)] = 0.0
     theta_reshaped = theta[trans_start : trans_start + n * (n - 1)].view(n, n - 1)
     theta_reshaped[:, min(2, n - 2)] = -8.0  # column feeding state index 3 stays near-zero prob
-    posterior = _fake_posterior(theta, layout)
+    return theta
+
+
+def test_fit_regime_mu_shrinks_rare_state_more_than_a_well_identified_control():
+    """A/B comparison, not an absolute-magnitude threshold: fit mu TWICE
+    from otherwise-identical setup (same centered_returns, seeds, advi_config,
+    mu_prior_scale, min_effective_observations), differing only in the
+    MS-EGARCH theta used to generate the (log_filtered_prob, log_var) draws
+    that condition the fit --
+
+      * "rare":    `_rare_state_theta` -- state 3 gets near-zero filtered mass.
+      * "control": plain `_known_theta` -- the transition-logit block is left
+        at all-zero, which softmaxes to an exactly uniform row every step
+        (see `transition_matrix`), so all 4 states get equal ~T/4 effective
+        observations and the shrinkage weight sits at its unclamped max (1.0)
+        for every state, including index 3.
+
+    `centered_returns` carries a real, nonzero drift (not pure noise) so a
+    well-identified state's ADVI fit has a genuine pull away from 0 to
+    demonstrate. Under `_known_theta`'s degenerate recursion (omega = alpha =
+    gamma = 0 for every state, so log-variance is pinned at its t=0 fixed
+    point of exactly 0 for the whole series -- see the fixed-point note in
+    `test_mu_log_joint_averages_draws_via_logsumexp_not_naive_mean`), that
+    variance path is IDENTICAL across states and across the rare/control
+    fixtures, so filtered occupancy is driven purely by the transition
+    structure, not by the data -- an apples-to-apples comparison.
+
+    An absolute-threshold assertion (as the previous version of this test
+    used) can't distinguish "the shrinkage mechanism singled out the
+    structurally-rare state" from "ADVI barely moved anything in this many
+    steps" -- both look like "mu_3 stayed small". Comparing state 3's fitted
+    mu head-to-head against the SAME index under the control fixture (where
+    it is not rare) can't pass that way: state 3 has to end up measurably
+    closer to 0 under the rare-occupancy scenario than under the
+    comparable-occupancy control for the assertion to hold.
+
+    n_steps=300 (vs Task 1/2's original 100) and drift=0.03 were chosen
+    empirically: at n_steps=100 both fits are dominated by the ADVI init and
+    the separation is small; at n_steps=300 the control's state 3 has had
+    room to pick up the drift signal while the rare state's stays pinned
+    near 0, giving a consistently large (~8-10x), seed-robust margin. Total
+    runtime for both fits is a few seconds -- well under the "under a
+    minute" budget for synthetic-data ADVI tests.
+    """
+    layout = MSEGARCHParamLayout()
+    n = layout.n_states
 
     torch.manual_seed(2)
-    centered_returns = torch.randn(200) * 0.01
+    centered_returns = torch.randn(200) * 0.01 + 0.03  # shared, nonzero-drift signal
     init_log_var, init_log_state_prob = default_recursion_init(layout)
 
-    advi_config = AdviConfig(n_steps=100, learning_rate=0.05, warmup_steps=10,
-                              elbo_ma_window=10, early_stop_patience=50)
-    gen = torch.Generator().manual_seed(3)
-    mu_posterior = fit_regime_mu(
-        centered_returns, posterior, advi_config, seeds=[0], device=torch.device("cpu"),
-        init_log_var=init_log_var, init_log_state_prob=init_log_state_prob, layout=layout,
-        n_draws=1, mu_prior_scale=0.05, min_effective_observations=50.0, generator=gen,
-    )
-    assert len(mu_posterior.seed_results) == 1
-    fitted_mu = mu_posterior.seed_results[0].mu
-    assert torch.isfinite(fitted_mu).all()
-    assert fitted_mu.shape == (layout.n_states,)
+    advi_config = AdviConfig(n_steps=300, learning_rate=0.05, warmup_steps=10,
+                              elbo_ma_window=10, early_stop_patience=100)
 
-    draw = sample_joint_draw(mu_posterior, generator=torch.Generator().manual_seed(4))
-    assert draw.shape == (layout.n_states,)
+    def _fit(theta: torch.Tensor) -> tuple[torch.Tensor, PooledPosterior]:
+        posterior = _fake_posterior(theta, layout)
+        gen = torch.Generator().manual_seed(3)
+        mu_posterior = fit_regime_mu(
+            centered_returns, posterior, advi_config, seeds=[0], device=torch.device("cpu"),
+            init_log_var=init_log_var, init_log_state_prob=init_log_state_prob, layout=layout,
+            n_draws=1, mu_prior_scale=0.05, min_effective_observations=50.0, generator=gen,
+        )
+        assert len(mu_posterior.seed_results) == 1
+        fitted_mu = mu_posterior.seed_results[0].mu
+        assert torch.isfinite(fitted_mu).all()
+        assert fitted_mu.shape == (n,)
+        return fitted_mu, mu_posterior
 
-    # The structurally-rare state's fitted posterior mean should stay much
-    # closer to the zero hyper-mean than a well-identified state's --
-    # exact equality isn't guaranteed (ADVI is stochastic optimization),
-    # but the shrinkage mechanism should visibly bias it toward zero.
-    assert abs(float(fitted_mu[3])) <= abs(float(fitted_mu[0])) + 1e-3 or abs(float(fitted_mu[3])) < 0.02
+    fitted_mu_rare, mu_posterior_rare = _fit(_rare_state_theta(layout))
+    fitted_mu_control, _ = _fit(_known_theta(layout))
+
+    draw = sample_joint_draw(mu_posterior_rare, generator=torch.Generator().manual_seed(4))
+    assert draw.shape == (n,)
+
+    # Sanity check: the control's state 3 actually picked up a real, nonzero
+    # pull from the drift signal -- otherwise the comparison below could
+    # pass vacuously because BOTH fits stayed near 0.
+    assert abs(float(fitted_mu_control[3])) > 0.008
+
+    # The core claim: the structurally-rare state's fitted mu is pulled
+    # measurably closer to the zero hyper-mean under the rare-occupancy
+    # scenario than the SAME state index is under the comparable-occupancy
+    # control -- a direct demonstration of the shrinkage mechanism.
+    assert abs(float(fitted_mu_rare[3])) < abs(float(fitted_mu_control[3]))
