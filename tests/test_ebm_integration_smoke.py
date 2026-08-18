@@ -2,6 +2,7 @@
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import yaml
 
@@ -19,7 +20,11 @@ from raemf_mc.regime.posterior_features import (
     compute_regime_labels,
 )
 from raemf_mc.models.ebm_classifier import fit_ebm_classifier, predict_scores
-from raemf_mc.models.calibration import apply_temperature, fit_temperature
+from raemf_mc.models.calibration import (
+    apply_temperature,
+    apply_temperature_log_prob,
+    fit_temperature,
+)
 from raemf_mc.bayesian.torch_backend import AdviConfig
 from raemf_mc.bayesian.priors import HierarchicalPriorConfig
 
@@ -81,6 +86,7 @@ def test_ebm_pipeline_end_to_end_on_real_data(tmp_path):
     )
 
     all_features = causal_features.join(vol_features, how="inner")
+    assert all_features.shape[1] == 11
     assert not all_features.isna().any().any()
 
     X_train = all_features.loc[returns_train.index].to_numpy()
@@ -90,8 +96,23 @@ def test_ebm_pipeline_end_to_end_on_real_data(tmp_path):
     y_val = labels.loc[returns_val.index].to_numpy()
     y_test = labels.loc[returns_test.index].to_numpy()
 
+    print(f"Label counts (train): {pd.Series(y_train).value_counts().to_dict()}")
+    print(f"Label counts (val):   {pd.Series(y_val).value_counts().to_dict()}")
+    print(f"Label counts (test):  {pd.Series(y_test).value_counts().to_dict()}")
+    assert len(set(y_train)) >= 2, (
+        f"EBM cannot train on a single-class y_train (got classes: {set(y_train)}); "
+        "this usually means the ADVI fit under-converged for this window/config."
+    )
+
     model = fit_ebm_classifier(X_train, y_train, random_state=0)
     class_to_idx = {c: i for i, c in enumerate(model.classes_)}
+    unseen_in_val = set(y_val) - set(class_to_idx)
+    unseen_in_test = set(y_test) - set(class_to_idx)
+    assert not unseen_in_val and not unseen_in_test, (
+        f"val/test contain classes the model never saw in training "
+        f"(model.classes_={list(model.classes_)}): "
+        f"unseen_in_val={unseen_in_val}, unseen_in_test={unseen_in_test}"
+    )
 
     scores_val = torch.tensor(predict_scores(model, X_val), dtype=torch.float32)
     y_val_idx = torch.tensor([class_to_idx[label] for label in y_val], dtype=torch.long)
@@ -105,7 +126,9 @@ def test_ebm_pipeline_end_to_end_on_real_data(tmp_path):
     # The model must actually have learned something, not just run.
     predicted_idx = calibrated_probs.argmax(dim=1)
     accuracy = (predicted_idx == y_test_idx).float().mean().item()
-    majority_class_idx = int(torch.bincount(y_val_idx).argmax())
+    # Baseline must come from the TEST set's own majority class — that is the
+    # partition accuracy is measured on.
+    majority_class_idx = int(torch.bincount(y_test_idx).argmax())
     baseline_accuracy = (y_test_idx == majority_class_idx).float().mean().item()
     assert accuracy >= baseline_accuracy
 
@@ -113,7 +136,7 @@ def test_ebm_pipeline_end_to_end_on_real_data(tmp_path):
         torch.log_softmax(scores_test, dim=1), y_test_idx
     ).item()
     nll_calibrated = torch.nn.functional.nll_loss(
-        torch.log(calibrated_probs), y_test_idx
+        apply_temperature_log_prob(scores_test, temperature), y_test_idx
     ).item()
     assert np.isfinite(nll_calibrated)
     # calibration is fit on val, evaluated on test — not guaranteed to

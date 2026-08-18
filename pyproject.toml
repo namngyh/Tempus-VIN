@@ -15,6 +15,7 @@ dependencies = [
     "scikit-learn",
     "statsmodels",
     "pyarrow",
+    "interpret",
 ]
 
 [project.optional-dependencies]

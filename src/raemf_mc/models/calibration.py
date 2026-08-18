@@ -24,5 +24,18 @@ def fit_temperature(
 
 
 def apply_temperature(scores: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Return calibrated class probabilities: softmax(scores / temperature)."""
+    """Return calibrated class probabilities: softmax(scores / temperature).
+
+    Use this when you need actual probabilities (argmax for a predicted
+    class, displaying calibrated probabilities). For NLL, use
+    apply_temperature_log_prob instead of log() of this output."""
     return torch.softmax(scores / temperature, dim=1)
+
+
+def apply_temperature_log_prob(scores: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Return calibrated log-probabilities: log_softmax(scores / temperature).
+    Prefer this over log(apply_temperature(...)) for any NLL computation —
+    log_softmax stays numerically finite even when temperature scaling
+    drives probabilities to float32 zero, which log() of an already-computed
+    probability cannot recover from."""
+    return torch.log_softmax(scores / temperature, dim=1)
