@@ -55,6 +55,7 @@ def test_scenario_mc_pipeline_end_to_end_on_real_data(tmp_path):
         init_log_var, init_log_state_prob, layout=layout,
         n_draws=config["mu_n_draws"], mu_prior_scale=config["mu_prior_scale"],
         min_effective_observations=config["mu_min_effective_observations"],
+        min_effective_fraction=config["mu_min_effective_fraction"],
         generator=mu_gen, fallback_log_path=tmp_path / "mu_fallbacks.json",
     )
     for r in mu_posterior.seed_results:
@@ -70,8 +71,13 @@ def test_scenario_mc_pipeline_end_to_end_on_real_data(tmp_path):
     assert daily_paths.shape == (config["mc_n_paths"], config["mc_horizon"])
     assert torch.isfinite(daily_paths).all()
 
+    # simulate_mc_paths returns centered-space returns (see its docstring);
+    # add the window's own historical mean back so the reported risk
+    # metrics reflect real-world VN-Index drift, not a zero-drift baseline.
+    daily_paths_real_scale = daily_paths.cpu().numpy() + log_returns.mean()
+
     risk_table = summarize_risk(
-        daily_paths.cpu().numpy(),
+        daily_paths_real_scale,
         horizons=tuple(config["mc_report_horizons"]),
         alphas=tuple(config["mc_alphas"]),
     )

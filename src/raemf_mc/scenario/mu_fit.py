@@ -59,6 +59,7 @@ def build_mu_log_joint(
     n_draws: int = 50,
     mu_prior_scale: float = 0.01,
     min_effective_observations: float = 30.0,
+    min_effective_fraction: float = 0.05,
     generator: torch.Generator | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Build log_joint(mu) for the mu_k ADVI fit. `theta` passed to the
@@ -72,7 +73,20 @@ def build_mu_log_joint(
     of log-likelihoods, which is a biased (Jensen's-inequality-downward)
     quantity. Same reasoning as MS-EGARCH's own level-space variance
     collapsing (docs/ms_egarch_design_decisions.md, decision (a)).
+
+    Note: this mixture uses FILTERED regime probabilities (which already
+    condition on the same observation being weighted), not predicted ones —
+    a pragmatic plug-in/"cut"-Bayes pseudo-likelihood, not a proper
+    conditional density. Exact predicted-probability weighting would
+    require exposing that intermediate quantity from
+    run_ms_egarch_recursion, which is out of this sub-project's scope.
     """
+    if generator is not None and generator.device != centered_returns.device:
+        raise ValueError(
+            f"generator is on {generator.device} but centered_returns is on "
+            f"{centered_returns.device} — construct the generator with "
+            f"torch.Generator(device=centered_returns.device) to match."
+        )
     log_filtered_all, log_var_all, nu_all = _precompute_draws(
         centered_returns, ms_egarch_posterior, init_log_var, init_log_state_prob,
         layout, n_draws, generator,
@@ -86,8 +100,18 @@ def build_mu_log_joint(
     # drives the shrinkage prior below (sparse regimes pulled harder toward
     # the zero hyper-mean), same mechanism sub-project 1 built for
     # omega/alpha/beta/gamma.
+    #
+    # The threshold is window-scaled exactly the way
+    # HierarchicalPriorConfig.shrinkage_threshold does it. `effective_obs`
+    # sums filtered probability over all T timesteps, so the four states'
+    # values sum to ~T; a fixed absolute floor of 30 therefore only ever
+    # binds once a state's occupancy drops under 30/T (~2% at T=1500), i.e.
+    # the mechanism this fit exists to provide would essentially never
+    # activate at real scale. The fraction is what makes it scale-aware.
+    T = centered_returns.shape[0]
+    shrinkage_threshold = max(min_effective_observations, min_effective_fraction * T)
     effective_obs = torch.exp(log_filtered_all).sum(dim=1).mean(dim=0)  # (n_states,)
-    shrink = state_shrinkage_weight(effective_obs, min_effective_observations)
+    shrink = state_shrinkage_weight(effective_obs, shrinkage_threshold)
     hyper_mean = torch.zeros(
         layout.n_states, dtype=centered_returns.dtype, device=centered_returns.device
     )
@@ -123,6 +147,7 @@ def fit_regime_mu(
     n_draws: int = 50,
     mu_prior_scale: float = 0.01,
     min_effective_observations: float = 30.0,
+    min_effective_fraction: float = 0.05,
     generator: torch.Generator | None = None,
     fallback_log_path: str | Path = "fallbacks.json",
 ) -> PooledPosterior:
@@ -134,7 +159,8 @@ def fit_regime_mu(
     log_joint = build_mu_log_joint(
         centered_returns, ms_egarch_posterior, init_log_var, init_log_state_prob,
         layout=layout, n_draws=n_draws, mu_prior_scale=mu_prior_scale,
-        min_effective_observations=min_effective_observations, generator=generator,
+        min_effective_observations=min_effective_observations,
+        min_effective_fraction=min_effective_fraction, generator=generator,
     )
     init_mu = torch.zeros(layout.n_states, dtype=centered_returns.dtype, device=device)
     init_log_sigma = torch.full(

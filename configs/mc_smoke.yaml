@@ -34,6 +34,7 @@ mu_advi:
 mu_n_draws: 50
 mu_prior_scale: 0.01
 mu_min_effective_observations: 30.0
+mu_min_effective_fraction: 0.05
 mc_n_paths: 500
 mc_horizon: 20
 mc_report_horizons: [1, 20]

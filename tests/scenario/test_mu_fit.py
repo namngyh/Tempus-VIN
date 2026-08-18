@@ -49,7 +49,11 @@ def test_mu_log_joint_matches_hand_computed_single_draw_likelihood():
     log_joint = build_mu_log_joint(
         centered_returns, posterior, init_log_var, init_log_state_prob,
         layout=layout, n_draws=1, mu_prior_scale=mu_prior_scale,
-        min_effective_observations=1.0,  # small enough that shrink clamps to 1.0 (no shrinkage) given >=1 effective obs per state on 30 real-ish points
+        # Threshold is max(min_effective_observations, min_effective_fraction * T)
+        # = max(1.0, 0.05 * 30) = 1.5, vs ~30/4 = 7.5 effective obs per state,
+        # so shrink clamps to 1.0 (no shrinkage) and the prior term below is
+        # exactly Normal(0, mu_prior_scale).
+        min_effective_observations=1.0,
     )
 
     mu_test = torch.tensor([0.001, -0.002, 0.0, 0.003])
@@ -138,6 +142,8 @@ def test_mu_log_joint_averages_draws_via_logsumexp_not_naive_mean():
     log_joint = build_mu_log_joint(
         centered_returns, posterior, init_log_var, init_log_state_prob,
         layout=layout, n_draws=2, mu_prior_scale=1e6,  # effectively flat prior, contributes ~0
+        # As above: threshold = max(1.0, 0.05 * 30) = 1.5 < ~7.5 effective
+        # obs per state, so shrink is 1.0 and the prior stays exactly flat.
         min_effective_observations=1.0,
     )
     actual = log_joint(mu_test)
@@ -165,7 +171,7 @@ def _rare_state_theta(layout: MSEGARCHParamLayout) -> torch.Tensor:
     return theta
 
 
-def test_fit_regime_mu_shrinks_rare_state_more_than_a_well_identified_control():
+def test_fit_regime_mu_shrinks_rare_state_more_than_a_well_identified_control(tmp_path):
     """A/B comparison, not an absolute-magnitude threshold: fit mu TWICE
     from otherwise-identical setup (same centered_returns, seeds, advi_config,
     mu_prior_scale, min_effective_observations), differing only in the
@@ -222,7 +228,13 @@ def test_fit_regime_mu_shrinks_rare_state_more_than_a_well_identified_control():
         mu_posterior = fit_regime_mu(
             centered_returns, posterior, advi_config, seeds=[0], device=torch.device("cpu"),
             init_log_var=init_log_var, init_log_state_prob=init_log_state_prob, layout=layout,
+            # Threshold is max(50.0, 0.05 * 200) = 50.0, i.e. the absolute
+            # floor still binds here and the fraction does not change what
+            # this test demonstrates: with T=200 over 4 states the control's
+            # ~50 effective obs per state sits right at the threshold while
+            # the rare state's is far below it.
             n_draws=1, mu_prior_scale=0.05, min_effective_observations=50.0, generator=gen,
+            fallback_log_path=tmp_path / "mu_fallbacks.json",
         )
         assert len(mu_posterior.seed_results) == 1
         fitted_mu = mu_posterior.seed_results[0].mu

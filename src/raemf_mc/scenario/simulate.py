@@ -160,12 +160,37 @@ def simulate_mc_paths(
     The simulated volatility process is kept inside the economically
     meaningful band described at the top of this module; how often that band
     binds, and how many sampled draws fell outside the model's own
-    stationarity region, are counted and reported to `fallback_log_path`."""
+    stationarity region, are counted and reported to `fallback_log_path`.
+
+    Returns CENTERED daily log returns (consistent with the
+    `centered_returns` input and the mu_k posterior, which was fit in the
+    same centered space) — NOT real-world returns. A caller that wants
+    real-world risk metrics (e.g. for VaR/CVaR reporting) must add the
+    window's own historical mean return back to this output before
+    computing them; this function deliberately does not do that itself,
+    to keep its contract consistent with its input.
+
+    Caveat: the risk/regime numbers these paths produce under a fast,
+    few-step ADVI config (see configs/mc_smoke.yaml) are for verifying
+    pipeline correctness, not for reporting as real research-grade risk
+    estimates — a meaningful fraction of such a fit's posterior draws can
+    sit outside the model's own stationarity region (see the module-level
+    comment above and the non-stationary-draw diagnostics this function
+    reports), which this function's bounds make SAFE to simulate from but
+    do not make STATISTICALLY WELL-IDENTIFIED. Full-scale numbers require a
+    properly converged ADVI fit (more steps, more seeds), not just a longer
+    window."""
     centered_returns = centered_returns.to(device) if device is not None else centered_returns
     init_log_var = init_log_var.to(device) if device is not None else init_log_var
     init_log_state_prob = (
         init_log_state_prob.to(device) if device is not None else init_log_state_prob
     )
+    if generator is not None and device is not None and generator.device != device:
+        raise ValueError(
+            f"generator is on {generator.device} but device={device} was "
+            f"requested — construct the generator with "
+            f"torch.Generator(device=device) to match."
+        )
     daily_returns = torch.zeros(
         n_paths, horizon, dtype=centered_returns.dtype, device=centered_returns.device
     )
@@ -203,9 +228,16 @@ def simulate_mc_paths(
         # identified, and hence the widest |z| the news-impact term may be
         # evaluated at (see note (1) at the top of the module).
         z_impact_max = (centered_returns / torch.exp(0.5 * history["log_var_bar"])).abs().max()
-        log_var_bar_prev = torch.clamp(
-            history["log_var_bar"][-1], min=log_var_lo, max=log_var_hi
-        )
+        # The variance INHERITED from the filter is subject to exactly the
+        # same band as every simulated step, so it must be counted the same
+        # way -- it is in fact the single most diagnostic saturation event
+        # there is ("the filter saturated the fitting-time clamp and handed
+        # simulation an already-absurd starting variance"), and leaving it
+        # out silently under-reported precisely that pathology.
+        inherited_log_var_bar = history["log_var_bar"][-1]
+        if bool((inherited_log_var_bar < log_var_lo) | (inherited_log_var_bar > log_var_hi)):
+            n_band_saturated_steps += 1
+        log_var_bar_prev = torch.clamp(inherited_log_var_bar, min=log_var_lo, max=log_var_hi)
         sigma_bar_prev = torch.exp(0.5 * log_var_bar_prev)
         z_prev = centered_returns[-1] / sigma_bar_prev
 
@@ -229,7 +261,10 @@ def simulate_mc_paths(
             log_var_bar_prev = log_var_h
 
     nonstationary_fraction = n_nonstationary_draws / max(n_paths, 1)
-    band_saturation_fraction = n_band_saturated_steps / max(n_paths * horizon, 1)
+    # horizon + 1 bounded quantities per path: the variance inherited from the
+    # filter, plus one per simulated day.
+    n_banded_steps = n_paths * (horizon + 1)
+    band_saturation_fraction = n_band_saturated_steps / max(n_banded_steps, 1)
     if (
         nonstationary_fraction > NONSTATIONARY_DRAW_REPORT_FRACTION
         or band_saturation_fraction > VOL_BAND_SATURATION_REPORT_FRACTION
@@ -244,6 +279,9 @@ def simulate_mc_paths(
                 "vol_band_multiple": vol_band_multiple,
                 "n_paths": n_paths,
                 "horizon": horizon,
+                # Denominator of vol_band_saturation_fraction: the inherited
+                # starting variance plus one per simulated day, per path.
+                "n_banded_steps": n_banded_steps,
                 "detail": (
                     "forward Monte Carlo needed its economic volatility band, "
                     "and/or sampled MS-EGARCH draws with |beta| >= 1 (outside "

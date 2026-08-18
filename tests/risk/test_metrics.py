@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from raemf_mc.risk.metrics import compute_cvar, compute_max_drawdown, compute_var, summarize_risk
 
@@ -31,6 +32,27 @@ def test_compute_max_drawdown_hand_computed():
     dd = compute_max_drawdown(daily)
     assert dd.shape == (1,)
     assert abs(dd[0] - 0.2591) < 1e-3
+
+
+def test_compute_max_drawdown_first_day_loss_is_not_invisible():
+    """Regression guard for the entry-price omission: the hand-computed
+    fixture above rises before it falls, so its running max is reached at an
+    interior point and it passes even when P_0 = 1 is never in the running
+    max. A path that only ever falls does not — it reported exactly 0.0
+    drawdown before the log-space rewrite."""
+    # A path that only ever falls: -30% on day 1, flat after.
+    # True drawdown from the P_0=1 entry: 1 - exp(-0.30) = 0.259182...
+    daily = np.array([[-0.30, 0.0, 0.0]])
+    dd = compute_max_drawdown(daily)
+    assert dd.shape == (1,)
+    assert abs(dd[0] - (1.0 - np.exp(-0.30))) < 1e-6
+
+
+def test_summarize_risk_rejects_horizon_longer_than_the_simulated_paths():
+    rng = np.random.default_rng(0)
+    daily_paths = rng.normal(loc=0.0, scale=0.01, size=(50, 10))
+    with pytest.raises(ValueError, match="exceeds the simulated path length"):
+        summarize_risk(daily_paths, horizons=(20,))
 
 
 def test_summarize_risk_shape_and_invariants():
