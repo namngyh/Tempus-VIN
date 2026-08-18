@@ -76,7 +76,8 @@ def test_ebm_pipeline_end_to_end_on_real_data(tmp_path):
         layout=layout, n_draws=config["n_posterior_draws"], generator=gen,
     )
     labels = compute_regime_labels(
-        posterior, centered_returns, init_log_var, init_log_state_prob, layout=layout
+        posterior, centered_returns, init_log_var, init_log_state_prob,
+        n_train=len(returns_train), layout=layout,
     )
 
     all_features = causal_features.join(vol_features, how="inner")

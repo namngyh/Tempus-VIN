@@ -85,12 +85,53 @@ def test_regime_labels_are_valid_state_names_and_reproducible():
     init_log_var, init_log_state_prob = default_recursion_init(layout)
 
     labels_1 = compute_regime_labels(
-        posterior, returns, init_log_var, init_log_state_prob, layout=layout
+        posterior, returns, init_log_var, init_log_state_prob, n_train=30, layout=layout
     )
     labels_2 = compute_regime_labels(
-        posterior, returns, init_log_var, init_log_state_prob, layout=layout
+        posterior, returns, init_log_var, init_log_state_prob, n_train=30, layout=layout
     )
     assert labels_1.name == "regime_label"
     assert list(labels_1.index) == list(dates)
     assert set(labels_1.unique()).issubset(set(STATE_NAMES))
     pd.testing.assert_series_equal(labels_1, labels_2)  # deterministic, no sampling
+
+
+def test_regime_labels_train_slice_unaffected_by_val_test_perturbation():
+    """Regression test for the align_states leakage bug: align_states used to
+    be fit over the FULL series, so the state->name permutation — and hence
+    the TRAINING targets — depended on val/test rows. Same train prefix +
+    different tail must yield byte-identical train-region labels.
+
+    Verified to FAIL against the pre-fix code path (with this seed the
+    full-series permutation moves from [2, 1, 0, 3] to [0, 3, 2, 1] when only
+    the tail changes) and to PASS after the fix.
+    """
+    layout = MSEGARCHParamLayout()
+    torch.manual_seed(4)
+    mus = [torch.randn(layout.total) * 0.05 for _ in range(2)]
+    posterior = _fake_posterior(mus, layout)
+    dates = pd.date_range("2020-01-01", periods=50, freq="D")
+    n_train = 30
+    base_returns = torch.randn(50) * 0.01
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    returns_a = pd.Series(base_returns.numpy(), index=dates)
+    perturbed_tail = base_returns.clone()
+    perturbed_tail[n_train:] = torch.randn(50 - n_train) * 0.05  # different tail
+    returns_b = pd.Series(perturbed_tail.numpy(), index=dates)
+
+    # The tail really does differ — otherwise this test proves nothing.
+    assert not returns_a.iloc[n_train:].equals(returns_b.iloc[n_train:])
+    pd.testing.assert_series_equal(returns_a.iloc[:n_train], returns_b.iloc[:n_train])
+
+    labels_a = compute_regime_labels(
+        posterior, returns_a, init_log_var, init_log_state_prob,
+        n_train=n_train, layout=layout,
+    )
+    labels_b = compute_regime_labels(
+        posterior, returns_b, init_log_var, init_log_state_prob,
+        n_train=n_train, layout=layout,
+    )
+    pd.testing.assert_series_equal(
+        labels_a.iloc[:n_train], labels_b.iloc[:n_train]
+    )
