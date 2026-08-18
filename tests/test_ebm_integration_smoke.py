@@ -2,7 +2,6 @@
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 import yaml
 
@@ -16,7 +15,6 @@ from raemf_mc.regime.ms_egarch import (
     fit_ms_egarch,
 )
 from raemf_mc.regime.posterior_features import (
-    canonical_theta,
     compute_posterior_volatility_features,
     compute_regime_labels,
 )
