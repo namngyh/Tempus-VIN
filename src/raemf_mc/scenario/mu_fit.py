@@ -31,9 +31,13 @@ def _precompute_draws(
     log_filtered_prob and log_var, and (n_draws,) nu."""
     T = centered_returns.shape[0]
     n = layout.n_states
-    log_filtered_all = torch.zeros(n_draws, T, n, dtype=centered_returns.dtype)
-    log_var_all = torch.zeros(n_draws, T, n, dtype=centered_returns.dtype)
-    nu_all = torch.zeros(n_draws, dtype=centered_returns.dtype)
+    log_filtered_all = torch.zeros(
+        n_draws, T, n, dtype=centered_returns.dtype, device=centered_returns.device
+    )
+    log_var_all = torch.zeros(
+        n_draws, T, n, dtype=centered_returns.dtype, device=centered_returns.device
+    )
+    nu_all = torch.zeros(n_draws, dtype=centered_returns.dtype, device=centered_returns.device)
     for i in range(n_draws):
         params = sample_ms_egarch_draw(ms_egarch_posterior, layout, generator=generator)
         result = run_ms_egarch_recursion(
@@ -83,8 +87,15 @@ def build_mu_log_joint(
     # omega/alpha/beta/gamma.
     effective_obs = torch.exp(log_filtered_all).sum(dim=1).mean(dim=0)  # (n_states,)
     shrink = state_shrinkage_weight(effective_obs, min_effective_observations)
-    hyper_mean = torch.zeros(layout.n_states, dtype=centered_returns.dtype)
-    base_scale = torch.full((layout.n_states,), mu_prior_scale, dtype=centered_returns.dtype)
+    hyper_mean = torch.zeros(
+        layout.n_states, dtype=centered_returns.dtype, device=centered_returns.device
+    )
+    base_scale = torch.full(
+        (layout.n_states,),
+        mu_prior_scale,
+        dtype=centered_returns.dtype,
+        device=centered_returns.device,
+    )
 
     def log_joint(mu: torch.Tensor) -> torch.Tensor:
         loc = mu.view(1, 1, -1)  # (1, 1, n_states)
