@@ -1,9 +1,11 @@
 import torch
 from raemf_mc.regime.ms_egarch import (
+    MSEGARCHParamLayout,
     MSEGARCHParams,
     run_ms_egarch_recursion,
     expected_abs_standardized_t,
     default_recursion_init,
+    unpack_params,
 )
 
 
@@ -173,3 +175,65 @@ def test_default_recursion_init_is_unit_variance_and_uniform_states():
     init_log_var, init_log_state_prob = default_recursion_init()
     assert torch.equal(init_log_var, torch.zeros(4))
     assert torch.allclose(torch.exp(init_log_state_prob), torch.full((4,), 0.25))
+
+
+def test_batched_recursion_matches_looping_over_single_thetas():
+    """Đường batch phải cho ra ĐÚNG cùng số học với việc gọi lần lượt từng
+    theta một — đây là hợp đồng nền tảng của toàn bộ đợt vector hoá: mọi
+    tăng tốc sau đó (ADVI nhiều MC sample, Monte Carlo nhiều path) đều dựa
+    vào giả định này. Dùng `assert_close` với dung sai mặc định của float32
+    chứ không phải bằng nhau tuyệt đối: thứ tự rút gọn (reduction) trong
+    logsumexp/softmax trên tensor (B, n) không nhất thiết trùng bit-đối-bit
+    với tensor (n,), nên sai khác cỡ ULP là hợp lệ và không phải lỗi.
+    """
+    layout = MSEGARCHParamLayout()
+    torch.manual_seed(11)
+    returns = torch.randn(120) * 0.01
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    thetas = torch.randn(6, layout.total) * 0.3
+    batched = run_ms_egarch_recursion(
+        returns, unpack_params(thetas, layout), init_log_var, init_log_state_prob
+    )
+    assert batched["log_var"].shape == (6, 120, layout.n_states)
+    assert batched["log_filtered_prob"].shape == (6, 120, layout.n_states)
+    assert batched["log_var_bar"].shape == (6, 120)
+    assert batched["total_log_lik"].shape == (6,)
+    assert batched["nu"].shape == (6,)
+
+    for i in range(6):
+        single = run_ms_egarch_recursion(
+            returns, unpack_params(thetas[i], layout), init_log_var, init_log_state_prob
+        )
+        torch.testing.assert_close(batched["log_var"][i], single["log_var"])
+        torch.testing.assert_close(
+            batched["log_filtered_prob"][i], single["log_filtered_prob"]
+        )
+        torch.testing.assert_close(batched["log_var_bar"][i], single["log_var_bar"])
+        torch.testing.assert_close(batched["total_log_lik"][i], single["total_log_lik"])
+        torch.testing.assert_close(batched["nu"][i], single["nu"])
+
+
+def test_batched_recursion_gradients_do_not_leak_across_batch_rows():
+    """Mỗi hàng batch phải hoàn toàn độc lập: gradient của total_log_lik của
+    hàng i theo theta của hàng j != i phải bằng đúng 0. Nếu một phép
+    broadcast nào đó vô tình trộn các hàng (ví dụ rút gọn nhầm chiều), test
+    này bắt được — trong khi test đối chiếu giá trị ở trên thì KHÔNG, vì
+    giá trị forward vẫn có thể đúng khi chỉ đường gradient bị hỏng. Đây là
+    điều kiện sống còn cho việc gộp nhiều MC sample vào một bước ADVI.
+    """
+    layout = MSEGARCHParamLayout()
+    torch.manual_seed(12)
+    returns = torch.randn(60) * 0.01
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    thetas = (torch.randn(3, layout.total) * 0.3).requires_grad_(True)
+    result = run_ms_egarch_recursion(
+        returns, unpack_params(thetas, layout), init_log_var, init_log_state_prob
+    )
+    result["total_log_lik"][1].backward()
+
+    assert thetas.grad is not None
+    assert torch.all(thetas.grad[0] == 0.0)
+    assert torch.all(thetas.grad[2] == 0.0)
+    assert torch.any(thetas.grad[1] != 0.0)

@@ -11,7 +11,7 @@ from raemf_mc.bayesian.torch_backend import AdviConfig, PooledPosterior, fit_mul
 from raemf_mc.regime.ms_egarch import (
     MSEGARCHParamLayout,
     run_ms_egarch_recursion,
-    sample_ms_egarch_draw,
+    sample_ms_egarch_draws,
     student_t_log_pdf_with_variance,
 )
 
@@ -30,24 +30,22 @@ def _precompute_draws(
     recomputing it inside the optimization loop would multiply cost by
     n_steps for no benefit. Returns stacked (n_draws, T, n_states)
     log_filtered_prob and log_var, and (n_draws,) nu."""
-    T = centered_returns.shape[0]
-    n = layout.n_states
-    log_filtered_all = torch.zeros(
-        n_draws, T, n, dtype=centered_returns.dtype, device=centered_returns.device
+    # Mot recursion BATCH thay cho n_draws recursion tuan tu: cac draw doc
+    # lap hoan toan voi nhau nen chung khac biet duy nhat la chieu batch dan
+    # dau. Voi n_draws=50, T=1500 day la 50 lan it vong lap Python hon, cung
+    # so hoc (xem test doi chieu batch/khong-batch trong
+    # tests/regime/test_ms_egarch_recursion.py).
+    params = sample_ms_egarch_draws(
+        ms_egarch_posterior, n_draws, layout, generator=generator
     )
-    log_var_all = torch.zeros(
-        n_draws, T, n, dtype=centered_returns.dtype, device=centered_returns.device
+    result = run_ms_egarch_recursion(
+        centered_returns, params, init_log_var, init_log_state_prob
     )
-    nu_all = torch.zeros(n_draws, dtype=centered_returns.dtype, device=centered_returns.device)
-    for i in range(n_draws):
-        params = sample_ms_egarch_draw(ms_egarch_posterior, layout, generator=generator)
-        result = run_ms_egarch_recursion(
-            centered_returns, params, init_log_var, init_log_state_prob
-        )
-        log_filtered_all[i] = result["log_filtered_prob"].detach()
-        log_var_all[i] = result["log_var"].detach()
-        nu_all[i] = result["nu"].detach()
-    return log_filtered_all, log_var_all, nu_all
+    return (
+        result["log_filtered_prob"].detach(),
+        result["log_var"].detach(),
+        result["nu"].detach(),
+    )
 
 
 def build_mu_log_joint(

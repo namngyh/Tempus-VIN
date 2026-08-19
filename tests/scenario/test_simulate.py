@@ -7,6 +7,7 @@ from raemf_mc.bayesian.torch_backend import FitResult, PooledPosterior
 from raemf_mc.regime.ms_egarch import MSEGARCHParamLayout, default_recursion_init
 from raemf_mc.scenario.simulate import (
     SIM_VOL_BAND_MULTIPLE,
+    _path_chunks,
     simulate_mc_paths,
     simulation_log_var_band,
 )
@@ -206,3 +207,51 @@ def test_simulate_mc_paths_does_not_censor_the_tail(tmp_path):
         f"max|r_h|/sigma_hi = {ratio:.3f}: the returned tail should sit far "
         "outside the volatility band, proving eps_h is never winsorized"
     )
+
+
+def test_path_chunks_partition_exactly():
+    """Chia lô phải phủ đúng n_paths, không thừa không thiếu — nếu sai, quy
+    mô nghiên cứu sẽ âm thầm mô phỏng ít path hơn số được yêu cầu và mọi
+    con số VaR/CVaR phía sau bị tính trên cỡ mẫu khác cỡ mẫu đã báo cáo."""
+    assert _path_chunks(500, None) == [500]
+    assert _path_chunks(500, 1000) == [500]
+    assert _path_chunks(500, 500) == [500]
+    assert _path_chunks(500, 200) == [200, 200, 100]
+    assert _path_chunks(400, 200) == [200, 200]
+    assert sum(_path_chunks(9999, 256)) == 9999
+    with pytest.raises(ValueError):
+        _path_chunks(10, 0)
+
+
+def test_simulate_mc_paths_chunked_matches_unchunked_in_shape_and_finiteness(tmp_path):
+    """Lô hoá KHÔNG cho ra cùng giá trị với chạy một lô (mỗi lô rút RNG
+    riêng, nên chuỗi ngẫu nhiên khác) — điều phải giữ là số path, tính hữu
+    hạn, và cùng bậc độ lớn thống kê. Test này ghi lại đúng hợp đồng đó thay
+    vì hứa hẹn một sự bằng nhau không tồn tại.
+    """
+    layout = MSEGARCHParamLayout()
+    theta = torch.zeros(layout.total)
+    theta[2 * layout.n_states : 3 * layout.n_states] = -1.0
+    theta[-1] = 3.0
+    ms_posterior = _fake_posterior(theta)
+    mu_posterior = _fake_posterior(torch.tensor([0.001, -0.001, 0.0, -0.002]))
+
+    torch.manual_seed(9)
+    centered_returns = torch.randn(80) * 0.01
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    kwargs = dict(
+        layout=layout, fallback_log_path=tmp_path / "fallbacks.json",
+    )
+    whole = simulate_mc_paths(
+        ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
+        n_paths=70, horizon=5, generator=torch.Generator().manual_seed(3), **kwargs,
+    )
+    chunked = simulate_mc_paths(
+        ms_posterior, mu_posterior, centered_returns, init_log_var, init_log_state_prob,
+        n_paths=70, horizon=5, generator=torch.Generator().manual_seed(3),
+        path_chunk_size=32, **kwargs,
+    )
+    assert whole.shape == chunked.shape == (70, 5)
+    assert torch.isfinite(whole).all()
+    assert torch.isfinite(chunked).all()

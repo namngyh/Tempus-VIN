@@ -108,4 +108,8 @@ def hierarchical_normal_log_prob(
     parameter harder toward the shared hyper-mean."""
     scale = base_scale * shrinkage_weight
     dist = torch.distributions.Normal(hyper_mean, scale)
-    return dist.log_prob(state_params).sum()
+    # sum(dim=-1) chứ không phải sum(): với đầu vào 1-D `(n_states,)` hai
+    # cách cho ra cùng một vô hướng, nhưng với đầu vào có chiều batch dẫn
+    # đầu `(B, n_states)` thì sum() sẽ gộp luôn cả batch thành một số —
+    # làm hỏng tính độc lập giữa các hàng batch mà ADVI batch dựa vào.
+    return dist.log_prob(state_params).sum(dim=-1)

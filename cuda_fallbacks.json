@@ -1,0 +1,50 @@
+[
+  {
+    "reason": "mc_simulation_bounds_engaged",
+    "nonstationary_draw_fraction": 0.90625,
+    "nonstationary_draw_threshold": 0.05,
+    "vol_band_saturation_fraction": 0.9971590909090909,
+    "vol_band_saturation_threshold": 0.05,
+    "vol_band_multiple": 10.0,
+    "n_paths": 64,
+    "horizon": 10,
+    "n_banded_steps": 704,
+    "detail": "forward Monte Carlo needed its economic volatility band, and/or sampled MS-EGARCH draws with |beta| >= 1 (outside the model's stationarity region). The simulated paths are bounded and usable, but the posterior they came from is not well identified"
+  },
+  {
+    "reason": "mc_simulation_bounds_engaged",
+    "nonstationary_draw_fraction": 0.9428571428571428,
+    "nonstationary_draw_threshold": 0.05,
+    "vol_band_saturation_fraction": 1.0,
+    "vol_band_saturation_threshold": 0.05,
+    "vol_band_multiple": 10.0,
+    "n_paths": 70,
+    "horizon": 5,
+    "n_banded_steps": 420,
+    "detail": "forward Monte Carlo needed its economic volatility band, and/or sampled MS-EGARCH draws with |beta| >= 1 (outside the model's stationarity region). The simulated paths are bounded and usable, but the posterior they came from is not well identified"
+  },
+  {
+    "reason": "mc_simulation_bounds_engaged",
+    "nonstationary_draw_fraction": 0.90625,
+    "nonstationary_draw_threshold": 0.05,
+    "vol_band_saturation_fraction": 0.9971590909090909,
+    "vol_band_saturation_threshold": 0.05,
+    "vol_band_multiple": 10.0,
+    "n_paths": 64,
+    "horizon": 10,
+    "n_banded_steps": 704,
+    "detail": "forward Monte Carlo needed its economic volatility band, and/or sampled MS-EGARCH draws with |beta| >= 1 (outside the model's stationarity region). The simulated paths are bounded and usable, but the posterior they came from is not well identified"
+  },
+  {
+    "reason": "mc_simulation_bounds_engaged",
+    "nonstationary_draw_fraction": 0.9428571428571428,
+    "nonstationary_draw_threshold": 0.05,
+    "vol_band_saturation_fraction": 1.0,
+    "vol_band_saturation_threshold": 0.05,
+    "vol_band_multiple": 10.0,
+    "n_paths": 70,
+    "horizon": 5,
+    "n_banded_steps": 420,
+    "detail": "forward Monte Carlo needed its economic volatility band, and/or sampled MS-EGARCH draws with |beta| >= 1 (outside the model's stationarity region). The simulated paths are bounded and usable, but the posterior they came from is not well identified"
+  }
+]

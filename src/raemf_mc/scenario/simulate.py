@@ -8,7 +8,7 @@ import torch
 from raemf_mc.bayesian.torch_backend import (
     PooledPosterior,
     append_fallback_log,
-    sample_joint_draw,
+    sample_joint_draws,
 )
 from raemf_mc.regime.ms_egarch import (
     MSEGARCHParamLayout,
@@ -16,7 +16,7 @@ from raemf_mc.regime.ms_egarch import (
     expected_abs_standardized_t,
     nu_from_raw,
     run_ms_egarch_recursion,
-    sample_ms_egarch_draw,
+    sample_ms_egarch_draws,
     transition_matrix,
 )
 
@@ -116,7 +116,7 @@ def _sample_standardized_t(nu: torch.Tensor, generator: torch.Generator | None) 
     T = Z / sqrt(V/nu), Z~N(0,1), V~ChiSquared(nu)=2*Gamma(nu/2,rate=1);
     then rescaled by sqrt((nu-2)/nu) to make Var(T)=1 exactly (matching
     student_t_log_pdf_with_variance's own scale convention)."""
-    z = torch.randn((), dtype=nu.dtype, device=nu.device, generator=generator)
+    z = torch.randn(nu.shape, dtype=nu.dtype, device=nu.device, generator=generator)
     chi2 = 2.0 * torch._standard_gamma(nu / 2, generator=generator)
     raw_t = z / torch.sqrt(chi2 / nu)
     scale_at_unit_variance = torch.sqrt((nu - 2) / nu)
@@ -136,6 +136,111 @@ def simulation_log_var_band(
     return log_var_window - half_width, log_var_window + half_width
 
 
+def _path_chunks(n_paths: int, path_chunk_size: int | None) -> list[int]:
+    """Chia n_paths thanh cac lo. `None` = mot lo duy nhat (mac dinh, giu
+    nguyen hanh vi don gian nhat). Bo nho dinh cua mot lo do recursion batch
+    quyet dinh: 2 tensor `(B, T, n_states)` float32, tuc
+    `2 * B * T * n_states * 4` byte (B=500, T=1500, n=4 -> ~24 MB;
+    B=10000, T=6264 -> ~2 GB). Dat lo khi chay quy mo nghien cuu de chan OOM.
+    """
+    if path_chunk_size is None or path_chunk_size >= n_paths:
+        return [n_paths]
+    if path_chunk_size <= 0:
+        raise ValueError(f"path_chunk_size phai duong, nhan {path_chunk_size!r}")
+    full, rest = divmod(n_paths, path_chunk_size)
+    return [path_chunk_size] * full + ([rest] if rest else [])
+
+
+def _simulate_path_chunk(
+    ms_egarch_posterior: PooledPosterior,
+    mu_posterior: PooledPosterior,
+    centered_returns: torch.Tensor,
+    init_log_var: torch.Tensor,
+    init_log_state_prob: torch.Tensor,
+    n_paths: int,
+    horizon: int,
+    layout: MSEGARCHParamLayout,
+    generator: torch.Generator | None,
+    log_var_lo: torch.Tensor,
+    log_var_hi: torch.Tensor,
+    device: torch.device | None,
+) -> tuple[torch.Tensor, int, int]:
+    """Mot lo path, hoan toan vector hoa. Tra ve
+    (daily_returns `(n_paths, horizon)`, so draw khong dung, so buoc cham
+    bien dai bien dong)."""
+    params = sample_ms_egarch_draws(ms_egarch_posterior, n_paths, layout, generator=generator)
+    mu = sample_joint_draws(mu_posterior, n_paths, generator=generator)
+    if device is not None:
+        params = MSEGARCHParams(
+            omega=params.omega.to(device),
+            alpha=params.alpha.to(device),
+            beta=params.beta.to(device),
+            gamma=params.gamma.to(device),
+            transition_logits=params.transition_logits.to(device),
+            nu_raw=params.nu_raw.to(device),
+        )
+        mu = mu.to(device)
+
+    trans = transition_matrix(params.transition_logits)      # (B, n, n)
+    nu = nu_from_raw(params.nu_raw)                          # (B,)
+    e_abs_z = expected_abs_standardized_t(nu)                # (B,)
+    n_nonstationary_draws = int((params.beta.abs() >= 1.0).any(dim=-1).sum().item())
+
+    history = run_ms_egarch_recursion(
+        centered_returns, params, init_log_var, init_log_state_prob
+    )
+    rows = torch.arange(n_paths, device=centered_returns.device)
+    state = torch.multinomial(
+        torch.exp(history["log_filtered_prob"][:, -1]), 1, generator=generator
+    ).squeeze(-1)                                            # (B,)
+    # The standardized innovations this draw's filter actually produced on
+    # the estimation window -- the support over which its alpha/gamma were
+    # identified, and hence the widest |z| the news-impact term may be
+    # evaluated at (see note (1) at the top of the module).
+    z_impact_max = (
+        centered_returns.unsqueeze(0) / torch.exp(0.5 * history["log_var_bar"])
+    ).abs().max(dim=-1).values                               # (B,)
+    # The variance INHERITED from the filter is subject to exactly the
+    # same band as every simulated step, so it must be counted the same
+    # way -- it is in fact the single most diagnostic saturation event
+    # there is ("the filter saturated the fitting-time clamp and handed
+    # simulation an already-absurd starting variance"), and leaving it
+    # out silently under-reported precisely that pathology.
+    inherited_log_var_bar = history["log_var_bar"][:, -1]     # (B,)
+    n_saturated = (
+        (inherited_log_var_bar < log_var_lo) | (inherited_log_var_bar > log_var_hi)
+    ).sum()
+    log_var_bar_prev = torch.clamp(inherited_log_var_bar, min=log_var_lo, max=log_var_hi)
+    sigma_bar_prev = torch.exp(0.5 * log_var_bar_prev)
+    z_prev = centered_returns[-1] / sigma_bar_prev            # (B,)
+
+    daily_returns = torch.zeros(
+        n_paths, horizon, dtype=centered_returns.dtype, device=centered_returns.device
+    )
+    for h in range(horizon):
+        state = torch.multinomial(trans[rows, state], 1, generator=generator).squeeze(-1)
+        z_impact = torch.clamp(z_prev, min=-z_impact_max, max=z_impact_max)
+        raw_log_var = (
+            params.omega[rows, state]
+            + params.beta[rows, state] * log_var_bar_prev
+            + params.alpha[rows, state] * (torch.abs(z_impact) - e_abs_z)
+            + params.gamma[rows, state] * z_impact
+        )
+        log_var_h = torch.clamp(raw_log_var, min=log_var_lo, max=log_var_hi)
+        n_saturated = n_saturated + (
+            (raw_log_var < log_var_lo) | (raw_log_var > log_var_hi)
+        ).sum()
+        eps_h = _sample_standardized_t(nu, generator)
+        sigma_h = torch.exp(0.5 * log_var_h)
+        daily_returns[:, h] = mu[rows, state] + sigma_h * eps_h
+        z_prev = eps_h
+        log_var_bar_prev = log_var_h
+
+    # Mot lan dong bo duy nhat o cuoi thay vi moi buoc -- `.item()` trong
+    # vong lap la thu ep CPU cho GPU va giet throughput.
+    return daily_returns, n_nonstationary_draws, int(n_saturated.item())
+
+
 def simulate_mc_paths(
     ms_egarch_posterior: PooledPosterior,
     mu_posterior: PooledPosterior,
@@ -149,6 +254,7 @@ def simulate_mc_paths(
     generator: torch.Generator | None = None,
     vol_band_multiple: float = SIM_VOL_BAND_MULTIPLE,
     fallback_log_path: str | Path = "fallbacks.json",
+    path_chunk_size: int | None = None,
 ) -> torch.Tensor:
     """Simulate n_paths independent Monte Carlo return paths of length
     horizon. Each path draws its own MS-EGARCH theta and mu vector
@@ -191,74 +297,28 @@ def simulate_mc_paths(
             f"requested — construct the generator with "
             f"torch.Generator(device=device) to match."
         )
-    daily_returns = torch.zeros(
-        n_paths, horizon, dtype=centered_returns.dtype, device=centered_returns.device
-    )
     log_var_lo, log_var_hi = simulation_log_var_band(centered_returns, vol_band_multiple)
 
+    # Vector hoa theo path. Truoc day moi path chay MOT recursion rieng
+    # (n_paths lan lap Python, moi lan T buoc) cong mot vong lap horizon voi
+    # `.item()` moi buoc. Gio toan bo path la chieu batch dan dau: dung MOT
+    # recursion batch, roi `horizon` buoc vector hoa, khong con `.item()`
+    # trong vong lap. So hoc tung path khong doi -- chi khac thu tu tieu thu
+    # RNG (xem `sample_joint_draws`), nen ket qua khong trung bit-doi-bit voi
+    # ban tuan tu cu du cung seed.
+    outputs = []
     n_nonstationary_draws = 0
     n_band_saturated_steps = 0
-
-    for p in range(n_paths):
-        params = sample_ms_egarch_draw(ms_egarch_posterior, layout, generator=generator)
-        mu = sample_joint_draw(mu_posterior, generator=generator)
-        if device is not None:
-            params = MSEGARCHParams(
-                omega=params.omega.to(device),
-                alpha=params.alpha.to(device),
-                beta=params.beta.to(device),
-                gamma=params.gamma.to(device),
-                transition_logits=params.transition_logits.to(device),
-                nu_raw=params.nu_raw.to(device),
-            )
-            mu = mu.to(device)
-        trans = transition_matrix(params.transition_logits)
-        nu = nu_from_raw(params.nu_raw)
-        e_abs_z = expected_abs_standardized_t(nu)
-        if bool((params.beta.abs() >= 1.0).any()):
-            n_nonstationary_draws += 1
-
-        history = run_ms_egarch_recursion(
-            centered_returns, params, init_log_var, init_log_state_prob
+    for chunk_n_paths in _path_chunks(n_paths, path_chunk_size):
+        chunk_returns, chunk_nonstat, chunk_saturated = _simulate_path_chunk(
+            ms_egarch_posterior, mu_posterior, centered_returns, init_log_var,
+            init_log_state_prob, chunk_n_paths, horizon, layout, generator,
+            log_var_lo, log_var_hi, device,
         )
-        state_dist = torch.exp(history["log_filtered_prob"][-1])
-        state = int(torch.multinomial(state_dist, 1, generator=generator).item())
-        # The standardized innovations this draw's filter actually produced on
-        # the estimation window -- the support over which its alpha/gamma were
-        # identified, and hence the widest |z| the news-impact term may be
-        # evaluated at (see note (1) at the top of the module).
-        z_impact_max = (centered_returns / torch.exp(0.5 * history["log_var_bar"])).abs().max()
-        # The variance INHERITED from the filter is subject to exactly the
-        # same band as every simulated step, so it must be counted the same
-        # way -- it is in fact the single most diagnostic saturation event
-        # there is ("the filter saturated the fitting-time clamp and handed
-        # simulation an already-absurd starting variance"), and leaving it
-        # out silently under-reported precisely that pathology.
-        inherited_log_var_bar = history["log_var_bar"][-1]
-        if bool((inherited_log_var_bar < log_var_lo) | (inherited_log_var_bar > log_var_hi)):
-            n_band_saturated_steps += 1
-        log_var_bar_prev = torch.clamp(inherited_log_var_bar, min=log_var_lo, max=log_var_hi)
-        sigma_bar_prev = torch.exp(0.5 * log_var_bar_prev)
-        z_prev = centered_returns[-1] / sigma_bar_prev
-
-        for h in range(horizon):
-            state = int(torch.multinomial(trans[state], 1, generator=generator).item())
-            z_impact = torch.clamp(z_prev, min=-z_impact_max, max=z_impact_max)
-            raw_log_var = (
-                params.omega[state]
-                + params.beta[state] * log_var_bar_prev
-                + params.alpha[state] * (torch.abs(z_impact) - e_abs_z)
-                + params.gamma[state] * z_impact
-            )
-            log_var_h = torch.clamp(raw_log_var, min=log_var_lo, max=log_var_hi)
-            if bool((raw_log_var < log_var_lo) | (raw_log_var > log_var_hi)):
-                n_band_saturated_steps += 1
-            eps_h = _sample_standardized_t(nu, generator)
-            sigma_h = torch.exp(0.5 * log_var_h)
-            r_h = mu[state] + sigma_h * eps_h
-            daily_returns[p, h] = r_h
-            z_prev = eps_h
-            log_var_bar_prev = log_var_h
+        outputs.append(chunk_returns)
+        n_nonstationary_draws += chunk_nonstat
+        n_band_saturated_steps += chunk_saturated
+    daily_returns = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
 
     nonstationary_fraction = n_nonstationary_draws / max(n_paths, 1)
     # horizon + 1 bounded quantities per path: the variance inherited from the
