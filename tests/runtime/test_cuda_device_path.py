@@ -103,7 +103,7 @@ def test_recursion_on_cuda_matches_cpu():
 
 
 @cuda_only
-def test_simulate_mc_paths_runs_end_to_end_on_cuda():
+def test_simulate_mc_paths_runs_end_to_end_on_cuda(tmp_path):
     """Đường Monte Carlo đầy đủ trên GPU: tensor trả về phải nằm trên CUDA,
     hữu hạn, và đúng hình dạng. Đây chính là kịch bản `gpu_research.yaml`
     nhắm tới và là thứ README ghi là "chưa từng được chạy thật"."""
@@ -125,7 +125,7 @@ def test_simulate_mc_paths_runs_end_to_end_on_cuda():
         ms_posterior, mu_posterior, centered_returns, init_log_var,
         init_log_state_prob, n_paths=64, horizon=10, layout=layout,
         device=device, generator=gen,
-        fallback_log_path="cuda_fallbacks.json",
+        fallback_log_path=tmp_path / "cuda_fallbacks.json",
     )
     assert paths.shape == (64, 10)
     assert paths.device.type == "cuda"
@@ -133,7 +133,7 @@ def test_simulate_mc_paths_runs_end_to_end_on_cuda():
 
 
 @cuda_only
-def test_simulate_mc_paths_chunking_covers_all_paths_on_cuda():
+def test_simulate_mc_paths_chunking_covers_all_paths_on_cuda(tmp_path):
     """Chia lô phải sinh đủ n_paths hàng kể cả khi n_paths không chia hết cho
     kích thước lô — cơ chế chặn OOM ở quy mô nghiên cứu chỉ có giá trị nếu
     nó không âm thầm cắt mất path."""
@@ -154,7 +154,7 @@ def test_simulate_mc_paths_chunking_covers_all_paths_on_cuda():
         ms_posterior, mu_posterior, centered_returns, init_log_var,
         init_log_state_prob, n_paths=70, horizon=5, layout=layout,
         device=device, generator=gen, path_chunk_size=32,
-        fallback_log_path="cuda_fallbacks.json",
+        fallback_log_path=tmp_path / "cuda_fallbacks.json",
     )
     assert paths.shape == (70, 5)
     assert torch.isfinite(paths).all()
