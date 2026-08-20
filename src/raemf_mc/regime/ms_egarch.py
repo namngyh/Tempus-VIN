@@ -18,6 +18,7 @@ from raemf_mc.bayesian.torch_backend import (
     append_fallback_log,
     fit_multi_seed_advi,
     sample_joint_draw,
+    sample_joint_draws,
 )
 
 N_STATES = 4
@@ -85,19 +86,29 @@ class MSEGARCHParams:
 def unpack_params(
     theta: torch.Tensor, layout: MSEGARCHParamLayout = MSEGARCHParamLayout()
 ) -> MSEGARCHParams:
+    """Tách vector theta phẳng thành các khối tham số MS-EGARCH.
+
+    Nhận cả theta 1-D `(P,)` (một tham số duy nhất) lẫn theta có MỘT chiều
+    batch dẫn đầu `(B, P)`. Ở dạng batch, mọi trường trả về đều mang thêm
+    chiều B dẫn đầu: omega/alpha/beta/gamma `(B, n)`, transition_logits
+    `(B, n, n-1)`, nu_raw `(B,)`. Đây là nền tảng cho toàn bộ đường batch
+    (ADVI nhiều MC sample, mô phỏng nhiều path) — xem
+    `run_ms_egarch_recursion`.
+    """
     n = layout.n_states
+    batch_shape = theta.shape[:-1]
     idx = 0
-    omega = theta[idx : idx + n]
+    omega = theta[..., idx : idx + n]
     idx += n
-    alpha = theta[idx : idx + n]
+    alpha = theta[..., idx : idx + n]
     idx += n
-    beta = theta[idx : idx + n]
+    beta = theta[..., idx : idx + n]
     idx += n
-    gamma = theta[idx : idx + n]
+    gamma = theta[..., idx : idx + n]
     idx += n
-    transition_logits = theta[idx : idx + n * (n - 1)].reshape(n, n - 1)
+    transition_logits = theta[..., idx : idx + n * (n - 1)].reshape(*batch_shape, n, n - 1)
     idx += n * (n - 1)
-    nu_raw = theta[idx : idx + 1].squeeze(-1)
+    nu_raw = theta[..., idx : idx + 1].squeeze(-1)
     return MSEGARCHParams(omega, alpha, beta, gamma, transition_logits, nu_raw)
 
 
@@ -105,11 +116,16 @@ def transition_matrix(transition_logits: torch.Tensor) -> torch.Tensor:
     """Each row's simplex = softmax of [0, logits_row] — fixes one free
     reference category per row so an (n_states-1)-length logit vector maps
     onto an n_states-simplex (avoids Dirichlet, which is a poor fit for
-    ADVI's Gaussian variational family)."""
-    n = transition_logits.shape[0]
-    zeros = torch.zeros(n, 1, dtype=transition_logits.dtype, device=transition_logits.device)
-    full_logits = torch.cat([zeros, transition_logits], dim=1)
-    return torch.softmax(full_logits, dim=1)
+    ADVI's Gaussian variational family).
+
+    Hoạt động với cả `(n, n-1)` lẫn `(B, n, n-1)` — mọi thao tác đều dùng
+    chỉ số chiều âm nên chiều batch dẫn đầu được giữ nguyên."""
+    zeros = torch.zeros(
+        *transition_logits.shape[:-1], 1,
+        dtype=transition_logits.dtype, device=transition_logits.device,
+    )
+    full_logits = torch.cat([zeros, transition_logits], dim=-1)
+    return torch.softmax(full_logits, dim=-1)
 
 
 def transition_logit_prior_loc(
@@ -214,65 +230,115 @@ def run_ms_egarch_recursion(
 
     `returns` must already be centered (MS-EGARCH models the innovation
     process, not the conditional mean).
+
+    BATCH: `params` được chấp nhận ở hai dạng —
+
+    - **Không batch** (như trước): omega/alpha/beta/gamma `(n,)`,
+      transition_logits `(n, n-1)`, nu_raw vô hướng. Kết quả trả về giữ
+      nguyên hình dạng cũ: log_var/log_filtered_prob `(T, n)`,
+      log_var_bar `(T,)`, total_log_lik và nu vô hướng.
+    - **Có batch**: thêm MỘT chiều B dẫn đầu vào mọi trường. Kết quả trả
+      về cũng có chiều B dẫn đầu: `(B, T, n)`, `(B, T)`, `(B,)`.
+
+    `returns` LUÔN là `(T,)` và được dùng chung cho cả batch — đúng với
+    mọi ca dùng thực tế ở đây (ADVI đánh giá nhiều theta trên CÙNG một
+    chuỗi dữ liệu; mô phỏng Monte Carlo rút nhiều theta trên cùng cửa sổ
+    ước lượng).
+
+    Toàn bộ số học chạy trên đường batch duy nhất; dạng không-batch chỉ là
+    B=1 được `unsqueeze` vào rồi `squeeze` ra. Điều này là CỐ Ý: nó bảo đảm
+    hai dạng không thể trôi khỏi nhau về mặt số học, và mọi test đã có của
+    dạng không-batch cũng là test của kernel batch.
+
+    Lý do tồn tại đường batch (đo trên RTX 4060 / CPU 16 nhân, T=1500):
+    một recursion tốn ~0.52s và gần như toàn bộ chi phí là 1500 vòng lặp
+    Python trên tensor 4 phần tử, KHÔNG phải phép tính. Gộp B theta vào
+    một lần chạy giữ nguyên số vòng lặp Python nhưng làm được B lần công
+    việc — nguồn tăng tốc chính của cả ADVI lẫn Monte Carlo.
     """
+    is_batched = params.omega.dim() == 2
+    if is_batched:
+        omega, alpha = params.omega, params.alpha
+        beta, gamma = params.beta, params.gamma
+        transition_logits = params.transition_logits
+        nu_raw = params.nu_raw
+    else:
+        omega, alpha = params.omega.unsqueeze(0), params.alpha.unsqueeze(0)
+        beta, gamma = params.beta.unsqueeze(0), params.gamma.unsqueeze(0)
+        transition_logits = params.transition_logits.unsqueeze(0)
+        nu_raw = params.nu_raw.reshape(1)
+
+    B, n = omega.shape
     T = returns.shape[0]
-    n = params.omega.shape[0]
-    trans = transition_matrix(params.transition_logits)
+
+    trans = transition_matrix(transition_logits)          # (B, n, n)
     log_trans = torch.log(trans + 1e-12)
-    nu = nu_from_raw(params.nu_raw)
-    e_abs_z = expected_abs_standardized_t(nu)
+    nu = nu_from_raw(nu_raw)                              # (B,)
+    e_abs_z = expected_abs_standardized_t(nu)             # (B,)
+    nu_col = nu.unsqueeze(-1)                             # (B, 1)
+    e_abs_z_col = e_abs_z.unsqueeze(-1)                   # (B, 1)
 
-    log_var = torch.zeros(T, n, dtype=returns.dtype, device=returns.device)
-    log_filtered = torch.zeros(T, n, dtype=returns.dtype, device=returns.device)
-    log_var_bar = torch.zeros(T, dtype=returns.dtype, device=returns.device)
+    log_var = torch.zeros(B, T, n, dtype=returns.dtype, device=returns.device)
+    log_filtered = torch.zeros(B, T, n, dtype=returns.dtype, device=returns.device)
+    log_var_bar = torch.zeros(B, T, dtype=returns.dtype, device=returns.device)
 
-    log_var_bar_prev = torch.logsumexp(init_log_state_prob + init_log_var, dim=0)
-    log_filt_prev = init_log_state_prob
-    z_prev = torch.zeros((), dtype=returns.dtype, device=returns.device)
-    total_log_lik = torch.zeros((), dtype=returns.dtype, device=returns.device)
+    init_lv = init_log_var.expand(B, n)
+    init_lsp = init_log_state_prob.expand(B, n)
+    log_var_bar_prev = torch.logsumexp(init_lsp + init_lv, dim=-1)   # (B,)
+    log_filt_prev = init_lsp                                          # (B, n)
+    z_prev = torch.zeros(B, dtype=returns.dtype, device=returns.device)
+    total_log_lik = torch.zeros(B, dtype=returns.dtype, device=returns.device)
     n_saturated = torch.zeros((), dtype=returns.dtype, device=returns.device)
 
     for t in range(T):
         raw_log_var_t = (
-            params.omega
-            + params.beta * log_var_bar_prev
-            + params.alpha * (torch.abs(z_prev) - e_abs_z)
-            + params.gamma * z_prev
+            omega
+            + beta * log_var_bar_prev.unsqueeze(-1)
+            + alpha * (torch.abs(z_prev).unsqueeze(-1) - e_abs_z_col)
+            + gamma * z_prev.unsqueeze(-1)
         )
         log_var_t = torch.clamp(raw_log_var_t, min=-_LOG_VAR_CLAMP, max=_LOG_VAR_CLAMP)
         # A clamped cell has an exactly-zero gradient, so it is invisible to
         # ADVI: no NaN, no retry, no log entry, just a flat plateau. Count the
         # saturated cells so the caller can tell "the clamp quietly saved us"
         # apart from "the clamp was never needed". Detached — diagnostic only,
-        # never part of the differentiated objective.
+        # never part of the differentiated objective. Ở dạng batch, đếm gộp
+        # trên toàn bộ (batch, timestep, state) và chia cho đúng số ô đó, nên
+        # phân số vẫn là "tỷ lệ ô chạm biên" như cũ.
         n_saturated = n_saturated + (
             raw_log_var_t.detach().abs() >= _LOG_VAR_CLAMP
         ).sum().to(returns.dtype)
-        log_var[t] = log_var_t
+        log_var[:, t] = log_var_t
 
         # Hamilton predict step: log P(S_t=k | F_{t-1})
-        log_pred = torch.logsumexp(log_trans + log_filt_prev.unsqueeze(1), dim=0)
+        log_pred = torch.logsumexp(log_trans + log_filt_prev.unsqueeze(-1), dim=-2)
 
         variance_t = torch.exp(log_var_t)
         loglik_t = student_t_log_pdf_with_variance(
-            returns[t], torch.zeros_like(variance_t), variance_t, nu
+            returns[t], torch.zeros_like(variance_t), variance_t, nu_col
         )
         log_joint_t = log_pred + loglik_t
-        log_norm = torch.logsumexp(log_joint_t, dim=0)
+        log_norm = torch.logsumexp(log_joint_t, dim=-1)               # (B,)
         total_log_lik = total_log_lik + log_norm
 
-        log_filt_t = log_joint_t - log_norm
-        log_filtered[t] = log_filt_t
+        log_filt_t = log_joint_t - log_norm.unsqueeze(-1)
+        log_filtered[:, t] = log_filt_t
 
-        log_var_bar_t = torch.logsumexp(log_filt_t + log_var_t, dim=0)
-        log_var_bar[t] = log_var_bar_t
+        log_var_bar_t = torch.logsumexp(log_filt_t + log_var_t, dim=-1)   # (B,)
+        log_var_bar[:, t] = log_var_bar_t
 
         sigma_bar_t = torch.exp(0.5 * log_var_bar_t)
         z_prev = returns[t] / sigma_bar_t
         log_var_bar_prev = log_var_bar_t
         log_filt_prev = log_filt_t
 
-    n_cells = max(T * n, 1)
+    n_cells = max(T * n * B, 1)
+    if not is_batched:
+        log_var = log_var.squeeze(0)
+        log_filtered = log_filtered.squeeze(0)
+        log_var_bar = log_var_bar.squeeze(0)
+        total_log_lik = total_log_lik.squeeze(0)
+        nu = nu.squeeze(0)
     return {
         "log_var": log_var,
         "log_filtered_prob": log_filtered,
@@ -349,26 +415,38 @@ def build_ms_egarch_log_joint(
         # gains a gradient incentive to starve a regime of occupancy purely to
         # lighten that regime's own prior penalty — state-killing pressure
         # that has nothing to do with fitting the data.
-        effective_obs = torch.exp(result["log_filtered_prob"]).sum(dim=0).detach()
+        # dim=-2 = chiều thời gian, cho cả (T, n) lẫn (B, T, n).
+        effective_obs = torch.exp(result["log_filtered_prob"]).sum(dim=-2).detach()
         weight = state_shrinkage_weight(effective_obs, shrinkage_threshold)
 
         log_prior = torch.zeros((), dtype=theta.dtype, device=theta.device)
         families = (params.omega, params.alpha, params.beta, params.gamma)
         for state_params, (loc, sc) in zip(families, hyper_mean_priors):
-            hyper_mean = state_params.mean()
+            # mean(dim=-1) gộp 4 trạng thái, KHÔNG gộp batch. unsqueeze(-1)
+            # đưa hyper_mean về dạng broadcast được với (..., n_states);
+            # với đầu vào không batch nó chỉ là vô hướng -> (1,), vẫn
+            # broadcast đúng như trước.
+            hyper_mean = state_params.mean(dim=-1)
             log_prior = log_prior + hierarchical_normal_log_prob(
-                state_params, hyper_mean, scale, weight
+                state_params, hyper_mean.unsqueeze(-1), scale, weight
             )
             log_prior = log_prior + torch.distributions.Normal(loc, sc).log_prob(hyper_mean)
         log_prior = log_prior + torch.distributions.Normal(
             trans_loc, trans_scale
-        ).log_prob(params.transition_logits).sum()
+        ).log_prob(params.transition_logits).sum(dim=(-2, -1))
+        # nu_raw là vô hướng khi không batch và (B,) khi có batch — không
+        # được .sum() vì thế sẽ gộp mất chiều batch.
         log_prior = log_prior + torch.distributions.Normal(
             nu_loc, nu_scale
-        ).log_prob(params.nu_raw).sum()
+        ).log_prob(params.nu_raw)
 
         return log_lik + log_prior
 
+    # Cờ hợp đồng cho engine ADVI: log_joint này chấp nhận theta `(S, P)` và
+    # trả về `(S,)`, nên ADVI được phép gộp toàn bộ n_mc_samples vào một lần
+    # gọi thay vì lặp tuần tự. Các log_joint khác không có cờ này vẫn đi
+    # đường tuần tự cũ — không có thay đổi ngầm nào cho chúng.
+    log_joint.supports_batched_theta = True
     return log_joint
 
 
@@ -426,4 +504,16 @@ def sample_ms_egarch_draw(
     generator: torch.Generator | None = None,
 ) -> MSEGARCHParams:
     theta = sample_joint_draw(posterior, generator=generator)
+    return unpack_params(theta, layout)
+
+
+def sample_ms_egarch_draws(
+    posterior: PooledPosterior,
+    n_draws: int,
+    layout: MSEGARCHParamLayout = MSEGARCHParamLayout(),
+    generator: torch.Generator | None = None,
+) -> MSEGARCHParams:
+    """`n_draws` rút độc lập, trả về MSEGARCHParams có chiều batch dẫn đầu
+    `(n_draws, ...)` — dùng trực tiếp được với `run_ms_egarch_recursion`."""
+    theta = sample_joint_draws(posterior, n_draws, generator=generator)
     return unpack_params(theta, layout)

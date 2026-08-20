@@ -108,12 +108,32 @@ def _single_attempt(
     for step in range(config.n_steps):
         optimizer.zero_grad()
         sigma = torch.exp(log_sigma)
-        elbo_samples = []
         try:
-            for _ in range(config.n_mc_samples):
-                eps = torch.randn(mu.shape, generator=generator, device=device)
+            if getattr(log_joint_fn, "supports_batched_theta", False):
+                # Đường batch: rút cả n_mc_samples eps một lần và đánh giá
+                # log_joint MỘT lần trên theta hình dạng (S, P). Đây là
+                # nguồn tăng tốc chính của ADVI — chi phí thực tế của
+                # log_joint MS-EGARCH nằm ở 1500 vòng lặp Python của
+                # recursion, không ở phép tính, nên S mẫu gộp lại gần như
+                # tốn bằng 1 mẫu (đo được: xem docs/perf_batching_notes.md).
+                #
+                # Đổi thứ tự tiêu thụ RNG so với đường tuần tự (một tensor
+                # (S, P) thay vì S tensor (P,)), nên quỹ đạo ADVI của cùng
+                # một seed KHÔNG trùng bit-đối-bit với bản trước khi vector
+                # hoá. Tính tái lập theo seed vẫn giữ nguyên (cùng seed ->
+                # cùng kết quả); thứ không giữ là so sánh xuyên phiên bản.
+                eps = torch.randn(
+                    (config.n_mc_samples, *mu.shape), generator=generator, device=device
+                )
                 theta = mu + sigma * eps
-                elbo_samples.append(log_joint_fn(theta))
+                mean_log_joint = log_joint_fn(theta).mean()
+            else:
+                elbo_samples = []
+                for _ in range(config.n_mc_samples):
+                    eps = torch.randn(mu.shape, generator=generator, device=device)
+                    theta = mu + sigma * eps
+                    elbo_samples.append(log_joint_fn(theta))
+                mean_log_joint = torch.stack(elbo_samples).mean()
         except (ValueError, RuntimeError, ArithmeticError) as exc:
             # log_joint can raise instead of returning a non-finite value —
             # torch.distributions argument validation rejects a NaN scale,
@@ -127,7 +147,6 @@ def _single_attempt(
                 False,
                 f"log_joint_raised: {type(exc).__name__}: {exc}",
             )
-        mean_log_joint = torch.stack(elbo_samples).mean()
         elbo = mean_log_joint + _gaussian_entropy(log_sigma)
         loss = -elbo
 
@@ -292,6 +311,34 @@ def fit_multi_seed_advi(
     return posterior
 
 
+def sample_joint_draws(
+    posterior: PooledPosterior, n_draws: int, generator: torch.Generator | None = None
+) -> torch.Tensor:
+    """Rút `n_draws` vector theta cùng lúc, trả về `(n_draws, P)`.
+
+    Ngữ nghĩa từng hàng giống hệt `sample_joint_draw`: mỗi hàng chọn ĐỘC LẬP
+    một seed theo phân phối đều rồi rút một mẫu reparameterize từ Gaussian
+    mean-field của seed đó. Khác biệt duy nhất là số lần gọi RNG — một tensor
+    `(n_draws,)` chỉ số cộng một tensor `(n_draws, P)` nhiễu, thay vì
+    `n_draws` cặp lời gọi riêng lẻ. Vì vậy chuỗi số ngẫu nhiên KHÔNG trùng
+    với việc gọi `sample_joint_draw` lặp `n_draws` lần; tính tái lập theo
+    seed vẫn nguyên vẹn (cùng generator -> cùng kết quả).
+
+    Tồn tại để `simulate_mc_paths` rút tham số cho toàn bộ path trong một
+    lần, tiền đề cho việc chạy MỘT recursion batch thay vì n_paths recursion
+    tuần tự.
+    """
+    device = posterior.seed_results[0].mu.device
+    n_seeds = len(posterior.seed_results)
+    idx = torch.randint(n_seeds, (n_draws,), generator=generator, device=device)
+    mu_stack = torch.stack([r.mu for r in posterior.seed_results])
+    log_sigma_stack = torch.stack([r.log_sigma for r in posterior.seed_results])
+    mu_sel = mu_stack[idx]
+    log_sigma_sel = log_sigma_stack[idx]
+    eps = torch.randn(mu_sel.shape, generator=generator, device=device)
+    return mu_sel + torch.exp(log_sigma_sel) * eps
+
+
 def sample_joint_draw(
     posterior: PooledPosterior, generator: torch.Generator | None = None
 ) -> torch.Tensor:
@@ -302,7 +349,13 @@ def sample_joint_draw(
     than resampling at each horizon step — this function performs no
     caching itself."""
     n_seeds = len(posterior.seed_results)
-    idx = int(torch.randint(n_seeds, (1,), generator=generator).item())
+    # device= là BẮT BUỘC: torch.randint mặc định cấp phát trên CPU, và một
+    # generator CUDA dùng với tensor CPU raise
+    # "Expected a 'cpu' device type for generator but found 'cuda'".
+    # Đây là lỗi đường GPU thật, đã tái hiện được trên RTX 4060 trước khi sửa
+    # (README ghi "đường GPU chưa từng chạy thật" — đây chính là cái nó ẩn).
+    device = posterior.seed_results[0].mu.device
+    idx = int(torch.randint(n_seeds, (1,), generator=generator, device=device).item())
     fr = posterior.seed_results[idx]
     eps = torch.randn(fr.mu.shape, generator=generator, device=fr.mu.device)
     return fr.mu + torch.exp(fr.log_sigma) * eps

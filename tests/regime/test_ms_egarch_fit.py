@@ -186,3 +186,41 @@ def test_fit_ms_egarch_moves_returns_to_the_requested_device(tmp_path):
     for r in posterior.seed_results:
         assert r.mu.device.type == device.type
         assert r.log_sigma.device.type == device.type
+
+
+def test_batched_log_joint_matches_loop_in_value_and_gradient():
+    """Hợp đồng mà engine ADVI dựa vào khi gộp n_mc_samples thành một lời
+    gọi: `log_joint(theta_(S,P))` phải bằng đúng việc gọi từng theta rồi
+    xếp chồng, KỂ CẢ gradient. Nếu chỉ giá trị đúng mà gradient sai, ADVI
+    vẫn chạy trơn tru và vẫn báo hội tụ — nhưng đang đi xuống một hướng
+    khác với hướng của mục tiêu thật, và không có test nào khác trong repo
+    bắt được điều đó.
+
+    Giá trị đối chiếu bằng dung sai mặc định; gradient nới ra atol=1e-5 vì
+    nó đi qua chuỗi tích luỹ dài hơn nhiều (T bước recursion) nên sai số
+    float32 cộng dồn lớn hơn — đo được thực tế ~2e-6.
+    """
+    layout = MSEGARCHParamLayout()
+    returns = _small_returns(T=200, seed=31)
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+    prior_config = HierarchicalPriorConfig(
+        hyper_mean_scale=1.0, min_effective_observations=30.0, min_effective_fraction=0.05
+    )
+    log_joint = build_ms_egarch_log_joint(
+        returns, init_log_var, init_log_state_prob, prior_config, layout
+    )
+    assert getattr(log_joint, "supports_batched_theta", False) is True
+
+    torch.manual_seed(32)
+    thetas = torch.randn(5, layout.total) * 0.3
+
+    batched = log_joint(thetas)
+    assert batched.shape == (5,)
+    looped = torch.stack([log_joint(thetas[i]) for i in range(5)])
+    torch.testing.assert_close(batched, looped)
+
+    theta_batch = thetas.clone().requires_grad_(True)
+    log_joint(theta_batch).mean().backward()
+    theta_loop = thetas.clone().requires_grad_(True)
+    torch.stack([log_joint(theta_loop[i]) for i in range(5)]).mean().backward()
+    torch.testing.assert_close(theta_batch.grad, theta_loop.grad, rtol=1e-4, atol=1e-5)
