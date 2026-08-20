@@ -1,5 +1,6 @@
 
 import pandas as pd
+import pytest
 import torch
 
 from raemf_mc.bayesian.torch_backend import FitResult, PooledPosterior
@@ -7,6 +8,7 @@ from raemf_mc.regime.ms_egarch import MSEGARCHParamLayout, default_recursion_ini
 from raemf_mc.regime.posterior_features import (
     canonical_theta,
     compute_posterior_volatility_features,
+    label_indices_from_filtered,
     regime_health_report,
 )
 from raemf_mc.regime.state_alignment import STATE_NAMES
@@ -229,3 +231,85 @@ def test_compute_regime_labels_logs_a_degenerate_fit(tmp_path):
     assert log_path.exists(), "fit suy bien phai duoc ghi log"
     content = log_path.read_text(encoding="utf-8")
     assert "degenerate_regime_fit" in content
+
+
+def test_label_indices_base_rate_recovers_a_regime_argmax_never_picks():
+    """Khuyet diem da do duoc, dung lai bang so hoc toi thieu: mot che do giu
+    30% khoi luong trung binh nhung KHONG NGAY NAO vuot che do dan dau, nen
+    argmax khong bao gio chon no va muc tieu tro thanh don lop. Chuan hoa
+    theo tan suat nen phai lay lai duoc chinh nhung ngay che do do manh bat
+    thuong.
+    """
+    T = 200
+    probs = torch.zeros(T, 4)
+    # che do 0 luon dan dau (0.60-0.70); che do 1 dao dong 0.20-0.40 nhung
+    # khong bao gio vuot che do 0; hai che do con lai gan rong.
+    ramp = torch.linspace(0.20, 0.40, T)
+    probs[:, 1] = ramp
+    probs[:, 0] = 0.95 - ramp
+    probs[:, 2] = 0.03
+    probs[:, 3] = 0.02
+    log_probs = torch.log(probs)
+
+    argmax_idx = label_indices_from_filtered(log_probs, n_train=T, scheme="argmax")
+    assert set(argmax_idx.tolist()) == {0}, "tien de cua test: argmax phai don lop"
+
+    base_idx = label_indices_from_filtered(log_probs, n_train=T, scheme="base_rate")
+    assert len(set(base_idx.tolist())) >= 2, "base_rate phai lay lai duoc che do thu hai"
+    # nhung ngay che do 1 manh nhat (cuoi ramp) phai duoc gan cho che do 1
+    assert base_idx[-1].item() == 1
+    # va nhung ngay no yeu nhat (dau ramp) van thuoc ve che do 0
+    assert base_idx[0].item() == 0
+
+
+def test_label_indices_base_rate_floor_blocks_near_empty_state_takeover():
+    """San tan suat nen phai chan mot che do gan rong thang bang mau so nho.
+    Khong co san, che do co pi ~ 0.002 se thang moi ngay chi vi phep chia --
+    doi mot dang suy bien lay mot dang suy bien khac.
+    """
+    T = 200
+    probs = torch.zeros(T, 4)
+    probs[:, 0] = 0.700
+    probs[:, 1] = 0.295
+    probs[:, 2] = 0.003
+    probs[:, 3] = 0.002
+    log_probs = torch.log(probs)
+
+    idx = label_indices_from_filtered(log_probs, n_train=T, scheme="base_rate")
+    # che do 2 va 3 gan rong: san keo pi cua chung len 0.05, nen ty le cua
+    # chung (0.003/0.05 = 0.06) thua xa che do 1 (0.295/0.295 = 1.0)
+    assert set(idx.tolist()) <= {0, 1}
+
+
+def test_label_indices_base_rate_uses_train_only_base_rate():
+    """Tan suat nen dinh nghia muc tieu huan luyen, nen chi duoc tinh tren
+    n_train dong dau. Neu ham nhin ca val/test de tinh pi thi muc tieu tro
+    thanh ham cua du lieu giu lai -- dung lop ro ri ma align_states da phai
+    sua mot lan (xem test_compute_regime_labels_fits_alignment_on_train_only).
+
+    Bo so duoc dung co chu dich de mot hang CU THE lat ke thang khi pham vi
+    tinh pi thay doi. Tren train, che do 0 va 1 gan can bang (pi ~ 0.455 va
+    0.435), nen hang [0.50, 0.30] thuoc ve che do 0. Neu tinh pi tren ca
+    chuoi, phan duoi keo pi[0] len 0.653 va dim pi[1] xuong 0.243, va chinh
+    hang do lat sang che do 1. Mot test khong co hang nao lat duoc se pass
+    ke ca khi n_train bi bo qua hoan toan.
+    """
+    T_train, T_tail = 100, 100
+    probs = torch.zeros(T_train + T_tail, 4)
+    probs[:90] = torch.tensor([0.45, 0.45, 0.05, 0.05])
+    probs[90:T_train] = torch.tensor([0.50, 0.30, 0.15, 0.05])   # hang se lat
+    probs[T_train:] = torch.tensor([0.85, 0.05, 0.05, 0.05])
+    log_probs = torch.log(probs)
+
+    idx_train_only = label_indices_from_filtered(log_probs, n_train=T_train, scheme="base_rate")
+    idx_whole = label_indices_from_filtered(log_probs, n_train=T_train + T_tail, scheme="base_rate")
+
+    assert idx_train_only[95].item() == 0
+    assert idx_whole[95].item() == 1
+    assert not torch.equal(idx_train_only, idx_whole)
+
+
+def test_label_indices_rejects_unknown_scheme():
+    log_probs = torch.log(torch.full((10, 4), 0.25))
+    with pytest.raises(ValueError):
+        label_indices_from_filtered(log_probs, n_train=10, scheme="khong_ton_tai")
