@@ -158,3 +158,78 @@ def test_simulate_mc_paths_chunking_covers_all_paths_on_cuda(tmp_path):
     )
     assert paths.shape == (70, 5)
     assert torch.isfinite(paths).all()
+
+
+@cuda_only
+def test_recursion_is_cuda_graph_capturable():
+    """Guard hồi quy cho ba phép sao chép CPU<->GPU ẩn đã được gỡ bỏ:
+    `float(n_saturated)` trong recursion, `torch.as_tensor(min_nu)` trong
+    `nu_from_raw`, và `torch.tensor(math.pi)` trong `_student_t_log_pdf`.
+    Mỗi cái đều vô hình trong lúc chạy bình thường và mỗi cái đều làm
+    `torch.cuda.graph` capture thất bại — đã tái hiện đủ cả ba lần khi thử.
+
+    CUDA graph đáng giá ở đây vì đo được: overhead phát kernel trên card
+    GeForce chạy WDDM là ~42 us/kernel ở chế độ eager và ~1,5 us khi phát
+    lại graph, và recursion T=1500 phát khoảng 37 500 kernel. Nếu một thay
+    đổi tương lai lén đưa lại một phép đồng bộ, cả đường đó sập về eager mà
+    không có dấu hiệu nào ngoài việc chậm đi ~30 lần — test này là thứ duy
+    nhất biến chuyện đó thành lỗi nhìn thấy được.
+    """
+    layout = MSEGARCHParamLayout()
+    device = torch.device("cuda")
+    torch.manual_seed(41)
+    returns = (torch.randn(64) * 0.01).to(device)
+    thetas = (torch.randn(3, layout.total) * 0.3).to(device)
+    params = unpack_params(thetas, layout)
+    init_log_var, init_log_state_prob = default_recursion_init(layout, device=device)
+
+    with torch.no_grad():
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                run_ms_egarch_recursion(
+                    returns, params, init_log_var, init_log_state_prob
+                )
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+
+        reference = run_ms_egarch_recursion(
+            returns, params, init_log_var, init_log_state_prob
+        )["total_log_lik"].clone()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run_ms_egarch_recursion(
+                returns, params, init_log_var, init_log_state_prob
+            )
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        captured["total_log_lik"], reference, rtol=1e-4, atol=1e-4
+    )
+
+
+@cuda_only
+def test_clamp_saturation_fraction_is_a_tensor_not_a_python_float():
+    """Hệ quả trực tiếp của việc gỡ phép đồng bộ: trường chẩn đoán này giờ
+    là tensor, và người gọi phải tự đổi sang float ở ngoài vùng capture.
+    Test này chốt hợp đồng đó — nếu ai đó đổi lại thành float thì recursion
+    hết capture được, và test ở trên sẽ gãy vì lý do trông chẳng liên quan
+    gì; test này chỉ thẳng vào nguyên nhân."""
+    layout = MSEGARCHParamLayout()
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    returns = (torch.randn(32) * 0.01).to(device)
+    params = unpack_params((torch.randn(layout.total) * 0.2).to(device), layout)
+    init_log_var, init_log_state_prob = default_recursion_init(layout, device=device)
+
+    result = run_ms_egarch_recursion(
+        returns, params, init_log_var, init_log_state_prob
+    )
+    frac = result["clamp_saturation_fraction"]
+    assert isinstance(frac, torch.Tensor)
+    assert frac.device.type == "cuda"
+    assert 0.0 <= float(frac) <= 1.0

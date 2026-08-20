@@ -122,7 +122,9 @@ def regime_health_report(
         "top_label_share": round(top_label_share, 4),
         "label_counts": label_counts,
         "nu": round(nu, 4),
-        "clamp_saturation_fraction": result["clamp_saturation_fraction"],
+        # float() ở đây, không phải trong recursion: báo cáo chẩn đoán luôn
+        # chạy ngoài vùng CUDA graph capture nên đồng bộ ở đây là an toàn.
+        "clamp_saturation_fraction": float(result["clamp_saturation_fraction"]),
     }
 
 
