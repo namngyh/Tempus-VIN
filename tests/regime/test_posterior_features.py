@@ -6,11 +6,13 @@ import torch
 from raemf_mc.bayesian.torch_backend import FitResult, PooledPosterior
 from raemf_mc.regime.ms_egarch import MSEGARCHParamLayout, default_recursion_init
 from raemf_mc.regime.posterior_features import (
+    align_theta_states,
     canonical_theta,
     compute_posterior_volatility_features,
     label_indices_from_filtered,
     regime_health_report,
 )
+from raemf_mc.regime.ms_egarch import transition_matrix, unpack_params
 from raemf_mc.regime.state_alignment import STATE_NAMES
 from raemf_mc.regime.posterior_features import compute_regime_labels
 
@@ -313,3 +315,90 @@ def test_label_indices_rejects_unknown_scheme():
     log_probs = torch.log(torch.full((10, 4), 0.25))
     with pytest.raises(ValueError):
         label_indices_from_filtered(log_probs, n_train=10, scheme="khong_ton_tai")
+
+
+def _permute_theta(theta, perm, layout):
+    """Đánh số lại bốn chế độ của một theta theo `perm`. Kết quả mô tả ĐÚNG
+    cùng một mô hình — đây chính là phép biến đổi mà hai seed khác nhau có
+    thể tình cờ khác nhau bởi."""
+    params = unpack_params(theta, layout)
+    trans = transition_matrix(params.transition_logits)[perm][:, perm]
+    logits = torch.log(trans[:, 1:] / trans[:, :1])
+    return torch.cat([
+        params.omega[perm], params.alpha[perm], params.beta[perm],
+        params.gamma[perm], logits.reshape(-1), params.nu_raw[perm],
+    ])
+
+
+def _distinct_theta(layout, seed=17):
+    torch.manual_seed(seed)
+    n = layout.n_states
+    return torch.cat([
+        torch.tensor([-3.0, -1.0, -2.0, -0.5]),      # omega, cố ý không sắp sẵn
+        torch.rand(n) * 0.3,                          # alpha
+        torch.tensor([0.3, 0.8, 0.5, 0.7]),           # beta
+        torch.randn(n) * 0.1,                         # gamma
+        torch.randn(n * (n - 1)) * 0.5,               # transition logits
+        torch.tensor([0.5, 2.0, 1.0, 3.0]),           # nu_raw
+    ])
+
+
+def test_align_theta_states_round_trips_the_transition_matrix():
+    """Hoán vị ma trận chuyển phải chính xác theo CẢ hàng lẫn cột. Không thể
+    hoán vị thẳng trên logit vì quy ước tham số hoá pin cột 0 làm mốc, nên
+    phải dựng ma trận xác suất, hoán vị, rồi quy ngược. Nếu bước quy ngược
+    sai, mô hình sau khi căn chỉnh sẽ có động lực chuyển chế độ khác hẳn —
+    một lỗi hoàn toàn vô hình với mọi khẳng định về hình dạng.
+    """
+    layout = MSEGARCHParamLayout()
+    theta = _distinct_theta(layout)
+    aligned = align_theta_states(theta, layout)
+
+    original = transition_matrix(unpack_params(theta, layout).transition_logits)
+    got = transition_matrix(unpack_params(aligned, layout).transition_logits)
+
+    # Thứ tự căn chỉnh là omega/(1-beta) tăng dần.
+    params = unpack_params(theta, layout)
+    order = torch.argsort(params.omega / (1.0 - torch.clamp(params.beta, -0.999, 0.999)))
+    torch.testing.assert_close(got, original[order][:, order])
+    # Mỗi hàng vẫn phải là một phân phối xác suất.
+    torch.testing.assert_close(got.sum(dim=1), torch.ones(layout.n_states))
+
+
+def test_canonical_theta_is_invariant_to_state_relabelling():
+    """Đây là hợp đồng mà toàn bộ thay đổi này tồn tại để bảo đảm.
+
+    Hai seed tìm ra CÙNG một nghiệm nhưng đánh số trạng thái khác nhau —
+    tình huống đã đo được thật: bốn seed cho ELBO gần như y hệt (4652,8 /
+    4655,7 / 4646,8 / 4648,6) trong khi ba trong bốn có cùng cấu trúc
+    occupancy chỉ khác hoán vị. Trung bình cộng của chúng phải trả lại CHÍNH
+    nghiệm đó, không phải một hỗn hợp của hai cách đánh số.
+
+    Không có căn chỉnh, phép trung bình cộng `omega[3]` của seed này với
+    `omega[3]` của seed kia — hai chỉ số chỉ hai chế độ khác nhau — cho ra
+    một theta không tương ứng với nghiệm nào cả.
+    """
+    layout = MSEGARCHParamLayout()
+    theta = _distinct_theta(layout)
+    relabelled = _permute_theta(theta, torch.tensor([2, 0, 3, 1]), layout)
+
+    posterior = _fake_posterior([theta, relabelled], layout)
+    result = canonical_theta(posterior, layout)
+
+    torch.testing.assert_close(result, align_theta_states(theta, layout))
+
+    # Và để chắc chắn test này không rỗng nghĩa: phép trung bình THÔ (cách
+    # cũ) phải cho ra kết quả KHÁC. Nếu không, hai theta vốn đã giống nhau
+    # và test ở trên chẳng chứng minh được gì.
+    naive = torch.stack([theta, relabelled]).mean(dim=0)
+    assert not torch.allclose(naive, result, atol=1e-3)
+
+
+def test_align_theta_states_is_idempotent():
+    """Căn chỉnh một theta đã căn chỉnh phải không đổi gì. Nếu không, kết
+    quả phụ thuộc vào số lần hàm được gọi — và `canonical_theta` gọi nó trên
+    mọi seed ở mọi lần dùng."""
+    layout = MSEGARCHParamLayout()
+    once = align_theta_states(_distinct_theta(layout), layout)
+    twice = align_theta_states(once, layout)
+    torch.testing.assert_close(once, twice)

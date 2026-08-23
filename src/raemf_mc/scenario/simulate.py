@@ -182,8 +182,10 @@ def _simulate_path_chunk(
         mu = mu.to(device)
 
     trans = transition_matrix(params.transition_logits)      # (B, n, n)
-    nu = nu_from_raw(params.nu_raw)                          # (B,)
-    e_abs_z = expected_abs_standardized_t(nu)                # (B,)
+    # (B, n): mot nu cho moi (path, trang thai). Mo phong tien phai chon
+    # dung nu cua trang thai HIEN TAI o moi buoc, khong phai mot nu chung.
+    nu_by_state = nu_from_raw(params.nu_raw.reshape(n_paths, -1).expand(n_paths, layout.n_states))
+    e_abs_z_by_state = expected_abs_standardized_t(nu_by_state)
     n_nonstationary_draws = int((params.beta.abs() >= 1.0).any(dim=-1).sum().item())
 
     history = run_ms_egarch_recursion(
@@ -223,14 +225,14 @@ def _simulate_path_chunk(
         raw_log_var = (
             params.omega[rows, state]
             + params.beta[rows, state] * log_var_bar_prev
-            + params.alpha[rows, state] * (torch.abs(z_impact) - e_abs_z)
+            + params.alpha[rows, state] * (torch.abs(z_impact) - e_abs_z_by_state[rows, state])
             + params.gamma[rows, state] * z_impact
         )
         log_var_h = torch.clamp(raw_log_var, min=log_var_lo, max=log_var_hi)
         n_saturated = n_saturated + (
             (raw_log_var < log_var_lo) | (raw_log_var > log_var_hi)
         ).sum()
-        eps_h = _sample_standardized_t(nu, generator)
+        eps_h = _sample_standardized_t(nu_by_state[rows, state], generator)
         sigma_h = torch.exp(0.5 * log_var_h)
         daily_returns[:, h] = mu[rows, state] + sigma_h * eps_h
         z_prev = eps_h

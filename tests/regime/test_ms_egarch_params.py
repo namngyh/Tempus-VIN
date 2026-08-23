@@ -16,8 +16,12 @@ def test_param_layout_totals_match_spec_budget():
     assert layout.n_states == 4
     assert layout.n_egarch_params == 16
     assert layout.n_transition_params == 12
-    assert layout.n_nu_params == 1
-    assert layout.total == 29  # 28 core + 1 global nu
+    # Mot nu cho MOI trang thai, khong phai mot nu dung chung. Doi tu 1 sang
+    # n_states sau khi do duoc rang mot nu chung buoc ca bon che do mang cung
+    # do day duoi: nu roi xuong san 2.05 mot cach he thong (2.15-2.21 tren ca
+    # ba seed) va lam moi con so VaR/CVaR mat y nghia kinh te.
+    assert layout.n_nu_params == 4
+    assert layout.total == 32  # 28 core + 4 nu (mot moi trang thai)
 
 
 def test_unpack_params_round_trip_shapes():
@@ -29,7 +33,7 @@ def test_unpack_params_round_trip_shapes():
     assert params.beta.shape == (4,)
     assert params.gamma.shape == (4,)
     assert params.transition_logits.shape == (4, 3)
-    assert params.nu_raw.shape == ()
+    assert params.nu_raw.shape == (4,)
 
 
 def test_transition_matrix_rows_sum_to_one():

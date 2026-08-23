@@ -8,21 +8,90 @@ import torch
 from raemf_mc.bayesian.torch_backend import PooledPosterior, append_fallback_log
 from raemf_mc.regime.ms_egarch import (
     MSEGARCHParamLayout,
+    MSEGARCHParams,
     nu_from_raw,
     run_ms_egarch_recursion,
     sample_ms_egarch_draw,
+    transition_matrix,
     unpack_params,
 )
 from raemf_mc.regime.state_alignment import STATE_NAMES, align_states, apply_alignment
 
 
-def canonical_theta(posterior: PooledPosterior) -> torch.Tensor:
+def _implied_unconditional_log_variance(params: MSEGARCHParams) -> torch.Tensor:
+    """log-phương sai vô điều kiện ngụ ý của từng chế độ: `omega / (1-beta)`.
+
+    `beta` được kẹp vào `[-0.999, 0.999]` CHỈ để xếp hạng. Prior của dự án
+    là ràng buộc mềm nên `|beta| >= 1` xảy ra thật (ledger sub-project 3 ghi
+    nhận 37% draw/state trong một fit thử nghiệm), và ở đó đại lượng này
+    phân kỳ. Kẹp lại giữ cho thứ tự luôn xác định mà không đổi thứ hạng của
+    những chế độ nằm trong vùng dừng — thứ duy nhất cần ở đây là một thứ tự
+    ỔN ĐỊNH và có nghĩa, không phải một ước lượng dùng để báo cáo.
+    """
+    beta_safe = torch.clamp(params.beta, min=-0.999, max=0.999)
+    return params.omega / (1.0 - beta_safe)
+
+
+def align_theta_states(
+    theta: torch.Tensor, layout: MSEGARCHParamLayout = MSEGARCHParamLayout()
+) -> torch.Tensor:
+    """Sắp lại bốn chế độ trong một vector theta theo log-phương sai vô điều
+    kiện tăng dần, trả về theta mới cùng hình dạng.
+
+    Bốn trạng thái của mô hình chuyển chế độ là HOÁN ĐỔI ĐƯỢC: đánh số lại
+    chúng cho ra đúng cùng một mô hình. Vì thế hai lần fit từ hai seed khác
+    nhau có thể tìm ra cùng một nghiệm nhưng gán chỉ số khác nhau — đã đo
+    được trực tiếp: bốn seed cho ELBO gần như y hệt (4652,8 / 4655,7 /
+    4646,8 / 4648,6) trong khi ba trong bốn có cùng cấu trúc occupancy chỉ
+    khác hoán vị (0,655/0,317 · 0,685/0,284 · 0,692/0,276).
+
+    Ma trận chuyển phải được hoán vị theo CẢ hàng LẪN cột, và không thể hoán
+    vị trực tiếp trên logit vì quy ước tham số hoá pin cột 0 làm mốc
+    (`transition_matrix` dùng softmax([0, logits])). Nên phải dựng ma trận
+    xác suất đầy đủ, hoán vị, rồi quy ngược về logit bằng
+    `log(P_j / P_0)` — chính là nghịch đảo của quy ước đó.
+    """
+    params = unpack_params(theta, layout)
+    order = torch.argsort(_implied_unconditional_log_variance(params))
+
+    trans = transition_matrix(params.transition_logits)
+    trans = trans[order][:, order]
+    # Nghịch đảo của softmax([0, logits]): cột 0 là mốc tham chiếu.
+    logits = torch.log(trans[:, 1:] / trans[:, :1].clamp_min(1e-30))
+
+    return torch.cat([
+        params.omega[order],
+        params.alpha[order],
+        params.beta[order],
+        params.gamma[order],
+        logits.reshape(-1),
+        params.nu_raw[order],
+    ])
+
+
+def canonical_theta(
+    posterior: PooledPosterior, layout: MSEGARCHParamLayout = MSEGARCHParamLayout()
+) -> torch.Tensor:
     """Deterministic point-estimate parameter vector: the mean of the
     variational mean (mu) across all pooled seeds. Used to generate a
     single reproducible target-label sequence — distinct from the random
     posterior draws used for the volatility uncertainty features below,
-    which need to reflect the posterior's actual spread, not collapse it."""
-    mus = torch.stack([r.mu for r in posterior.seed_results])
+    which need to reflect the posterior's actual spread, not collapse it.
+
+    MỖI seed được sắp lại trạng thái TRƯỚC khi lấy trung bình. Không có bước
+    đó, phép trung bình cộng `omega[3]` của seed 0 với `omega[3]` của seed 1
+    khi hai chỉ số ấy chỉ hai chế độ khác nhau — một phép toán vô nghĩa cho
+    ra một theta không tương ứng với nghiệm nào cả. Đã đo được label
+    switching thật giữa các seed (xem `align_theta_states`), và chưa cắn ai
+    chỉ vì mọi config smoke dùng đúng một seed; `gpu_research.yaml` dùng tám.
+
+    Việc sắp lại KHÔNG phải là chọn lọc seed: pooling vẫn đều trọng số trên
+    toàn bộ seed, đúng quy tắc "không cherry-pick" mà `PooledPosterior` đặt
+    ra. Nó chỉ làm cho phép cộng có nghĩa.
+    """
+    mus = torch.stack([
+        align_theta_states(r.mu, layout) for r in posterior.seed_results
+    ])
     return mus.mean(dim=0)
 
 
@@ -89,7 +158,9 @@ def regime_health_report(
         name = STATE_NAMES[k]
         label_counts[name] = label_counts.get(name, 0) + 1
 
-    nu = float(nu_from_raw(params.nu_raw))
+    # nu gio rieng theo trang thai; lay gia tri NHO NHAT vi do la trang thai
+    # co duoi nang nhat, tuc truong hop xau nhat cho moi con so VaR/CVaR.
+    nu = float(nu_from_raw(params.nu_raw).min())
     max_occupancy = max(occupancy)
     n_classes = len(label_counts)
     top_label_share = max(label_counts.values()) / max(len(train_labels), 1)
@@ -277,7 +348,9 @@ def _health_from_result(
     for k in label_idx[:n_train]:
         name = STATE_NAMES[k]
         label_counts[name] = label_counts.get(name, 0) + 1
-    nu = float(nu_from_raw(params.nu_raw))
+    # nu gio rieng theo trang thai; lay gia tri NHO NHAT vi do la trang thai
+    # co duoi nang nhat, tuc truong hop xau nhat cho moi con so VaR/CVaR.
+    nu = float(nu_from_raw(params.nu_raw).min())
     max_occupancy = max(occupancy)
     n_classes = len(label_counts)
 

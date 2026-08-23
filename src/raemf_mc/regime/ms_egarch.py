@@ -69,7 +69,21 @@ class MSEGARCHParamLayout:
 
     @property
     def n_nu_params(self) -> int:
-        return 1
+        """MOT nu cho MOI trang thai, khong phai mot nu dung chung.
+
+        Ban dau day la 1. Do duoc tren du lieu that: voi mot nu dung chung,
+        nu roi xuong san 2.05 mot cach he thong (2.15-2.21 tren ca ba seed),
+        khien Student-t co kurtosis vo han va VaR_95 o chan troi 20 ngay ra
+        91.6% -- mot con so vo nghia ve kinh te.
+
+        Co che: voi ~72% so phien nam o che do yen tinh, cac phien bat
+        thuong co hai cach duoc giai thich -- chuyen sang che do bien dong
+        cao, hoac duoi day. Ma tran chuyen rat dai dang (tu chuyen 0.96)
+        phat cach thu nhat, nen mo hinh chon cach thu hai, va MOT nu dung
+        chung buoc ca bon che do phai mang do day duoi ma chi rieng cac
+        phien bat thuong doi hoi. Che do yen tinh va che do khung hoang
+        khong co ly do gi phai cung do day duoi."""
+        return self.n_states
 
     @property
     def total(self) -> int:
@@ -94,7 +108,7 @@ def unpack_params(
     Nhận cả theta 1-D `(P,)` (một tham số duy nhất) lẫn theta có MỘT chiều
     batch dẫn đầu `(B, P)`. Ở dạng batch, mọi trường trả về đều mang thêm
     chiều B dẫn đầu: omega/alpha/beta/gamma `(B, n)`, transition_logits
-    `(B, n, n-1)`, nu_raw `(B,)`. Đây là nền tảng cho toàn bộ đường batch
+    `(B, n, n-1)`, nu_raw `(B, n)`. Đây là nền tảng cho toàn bộ đường batch
     (ADVI nhiều MC sample, mô phỏng nhiều path) — xem
     `run_ms_egarch_recursion`.
     """
@@ -111,7 +125,7 @@ def unpack_params(
     idx += n
     transition_logits = theta[..., idx : idx + n * (n - 1)].reshape(*batch_shape, n, n - 1)
     idx += n * (n - 1)
-    nu_raw = theta[..., idx : idx + 1].squeeze(-1)
+    nu_raw = theta[..., idx : idx + n]
     return MSEGARCHParams(omega, alpha, beta, gamma, transition_logits, nu_raw)
 
 
@@ -259,7 +273,7 @@ def run_ms_egarch_recursion(
     BATCH: `params` được chấp nhận ở hai dạng —
 
     - **Không batch** (như trước): omega/alpha/beta/gamma `(n,)`,
-      transition_logits `(n, n-1)`, nu_raw vô hướng. Kết quả trả về giữ
+      transition_logits `(n, n-1)`, nu_raw `(n,)`. Kết quả trả về giữ
       nguyên hình dạng cũ: log_var/log_filtered_prob `(T, n)`,
       log_var_bar `(T,)`, total_log_lik và nu vô hướng.
     - **Có batch**: thêm MỘT chiều B dẫn đầu vào mọi trường. Kết quả trả
@@ -291,17 +305,20 @@ def run_ms_egarch_recursion(
         omega, alpha = params.omega.unsqueeze(0), params.alpha.unsqueeze(0)
         beta, gamma = params.beta.unsqueeze(0), params.gamma.unsqueeze(0)
         transition_logits = params.transition_logits.unsqueeze(0)
-        nu_raw = params.nu_raw.reshape(1)
+        nu_raw = params.nu_raw.reshape(1, -1)
 
     B, n = omega.shape
     T = returns.shape[0]
 
     trans = transition_matrix(transition_logits)          # (B, n, n)
     log_trans = torch.log(trans + 1e-12)
-    nu = nu_from_raw(nu_raw)                              # (B,)
-    e_abs_z = expected_abs_standardized_t(nu)             # (B,)
-    nu_col = nu.unsqueeze(-1)                             # (B, 1)
-    e_abs_z_col = e_abs_z.unsqueeze(-1)                   # (B, 1)
+    # Chuan hoa nu_raw ve (B, n). Chap nhan ca dang MOT nu dung chung (vo
+    # huong hoac (B, 1)) lan dang MOT nu MOI TRANG THAI ((n,) hoac (B, n)):
+    # dang dung chung chi la truong hop dac biet duoc broadcast, nen moi
+    # theta/test viet theo layout cu van chay dung nhu truoc.
+    nu_col = nu_from_raw(nu_raw.reshape(B, -1).expand(B, n))   # (B, n)
+    nu = nu_col
+    e_abs_z_col = expected_abs_standardized_t(nu_col)          # (B, n)
 
     log_var = torch.zeros(B, T, n, dtype=returns.dtype, device=returns.device)
     log_filtered = torch.zeros(B, T, n, dtype=returns.dtype, device=returns.device)
@@ -469,11 +486,12 @@ def build_ms_egarch_log_joint(
         log_prior = log_prior + torch.distributions.Normal(
             trans_loc, trans_scale
         ).log_prob(params.transition_logits).sum(dim=(-2, -1))
-        # nu_raw là vô hướng khi không batch và (B,) khi có batch — không
-        # được .sum() vì thế sẽ gộp mất chiều batch.
+        # sum(dim=-1) tren chieu TRANG THAI: nu_raw gio la (n,) khong batch
+        # va (B, n) khi batch, nen phai gop bon trang thai lai ma khong gop
+        # chieu batch.
         log_prior = log_prior + torch.distributions.Normal(
             nu_loc, nu_scale
-        ).log_prob(params.nu_raw)
+        ).log_prob(params.nu_raw).sum(dim=-1)
 
         return log_lik + log_prior
 

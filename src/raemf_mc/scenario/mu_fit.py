@@ -91,7 +91,9 @@ def build_mu_log_joint(
     )
     returns_col = centered_returns.view(1, -1, 1)  # (1, T, 1)
     variance_all = torch.exp(log_var_all)  # (n_draws, T, n_states)
-    nu_col = nu_all.view(-1, 1, 1)  # (n_draws, 1, 1)
+    # (n_draws, 1, n_states): nu gio rieng theo trang thai, nen chieu cuoi
+    # phai la trang thai de khop voi variance_all (n_draws, T, n_states).
+    nu_col = nu_all.unsqueeze(1)
     log_n = math.log(n_draws)
 
     # Per-state effective observation count, averaged across draws --

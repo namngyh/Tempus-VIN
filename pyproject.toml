@@ -26,3 +26,19 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
+
+# Khai bao select TUONG MINH thay vi dua vao mac dinh cua ruff. Ly do cu the:
+# du an nay chay ruff sach tren may phat trien dau tien, nhung ruff 0.16.3
+# tren may GPU bao 40 loi tren dung nhung file khong he thay doi -- cac ban
+# ruff moi bat them nhieu rule vao bo mac dinh. Khong khai bao select nghia
+# la chinh sach lint cua du an tro thanh mot ham cua phien ban ruff dang cai,
+# va "suite sach" mat het y nghia khi chuyen may.
+#
+# ["E4", "E7", "E9", "F"] chinh la bo MAC DINH lich su cua ruff, tuc dung bo
+# ma "suite sach" cua du an nay von duoc do bang. Da kiem chung: chon "E"
+# thay vi "E4/E7/E9" bat them E501 (do dai dong) va lam lo ra 16 vi pham co
+# san trong cac file test -- nghia la chon "E" khong phai khoi phuc hanh vi
+# cu ma la them rule moi. Nang bo rule la mot quyet dinh co y thuc, tach
+# rieng khoi viec cham dut phu thuoc vao phien ban ruff.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -199,7 +199,7 @@ def test_batched_recursion_matches_looping_over_single_thetas():
     assert batched["log_filtered_prob"].shape == (6, 120, layout.n_states)
     assert batched["log_var_bar"].shape == (6, 120)
     assert batched["total_log_lik"].shape == (6,)
-    assert batched["nu"].shape == (6,)
+    assert batched["nu"].shape == (6, layout.n_states)
 
     for i in range(6):
         single = run_ms_egarch_recursion(
@@ -237,3 +237,64 @@ def test_batched_recursion_gradients_do_not_leak_across_batch_rows():
     assert torch.all(thetas.grad[0] == 0.0)
     assert torch.all(thetas.grad[2] == 0.0)
     assert torch.any(thetas.grad[1] != 0.0)
+
+
+def test_recursion_uses_a_separate_nu_per_regime():
+    """nu riêng từng chế độ phải thực sự tới được hàm mật độ, không phải chỉ
+    tồn tại trong layout. Dựng một chế độ có đuôi rất nặng (nu ~ 2,3) cạnh
+    một chế độ gần Gauss (nu ~ 30): nếu recursion vẫn dùng một nu dùng chung
+    thì bốn giá trị trả về sẽ bằng nhau và test này gãy.
+
+    Lý do đổi: với một nu dùng chung, đo được nu rơi xuống sàn 2,05 một cách
+    hệ thống (2,15-2,21 trên cả ba seed) vì nó bị buộc phải hấp thụ đuôi của
+    những phiên bất thường cho cả bốn chế độ cùng lúc.
+    """
+    layout = MSEGARCHParamLayout()
+    torch.manual_seed(13)
+    returns = torch.randn(80) * 0.01
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    theta = torch.zeros(layout.total)
+    theta[2 * layout.n_states : 3 * layout.n_states] = 0.5          # beta ổn định
+    # nu = 2.05 + softplus(nu_raw): nu_raw = -2 -> ~2.18; nu_raw = 3.3 -> ~5.4
+    theta[-layout.n_states :] = torch.tensor([-2.0, 0.0, 1.5, 3.3])
+
+    result = run_ms_egarch_recursion(
+        returns, unpack_params(theta, layout), init_log_var, init_log_state_prob
+    )
+    nu = result["nu"]
+    assert nu.shape == (layout.n_states,)
+    assert nu[0] < 2.3, "chế độ đầu phải có đuôi rất nặng"
+    assert nu[3] > 5.0, "chế độ cuối phải gần Gauss hơn hẳn"
+    assert torch.all(nu[:-1] < nu[1:]), "nu phải tăng đúng theo nu_raw đã đặt"
+    assert torch.isfinite(result["total_log_lik"]).all()
+
+
+def test_recursion_still_accepts_a_single_shared_nu():
+    """Tương thích ngược: một `nu_raw` vô hướng (layout cũ, và mọi fixture
+    test viết trước thay đổi này) vẫn phải chạy, được hiểu là cùng một nu
+    cho cả bốn chế độ. Nếu mất tính chất này thì mọi theta lưu từ trước và
+    mọi test cũ đều gãy mà không có đường di trú nào.
+    """
+    layout = MSEGARCHParamLayout()
+    torch.manual_seed(14)
+    returns = torch.randn(60) * 0.01
+    init_log_var, init_log_state_prob = default_recursion_init(layout)
+
+    shared = MSEGARCHParams(
+        omega=torch.full((4,), -1.0),
+        alpha=torch.full((4,), 0.2),
+        beta=torch.full((4,), 0.5),
+        gamma=torch.zeros(4),
+        transition_logits=torch.zeros(4, 3),
+        nu_raw=torch.tensor(2.0),                    # vô hướng, dùng chung
+    )
+    per_state = MSEGARCHParams(
+        omega=shared.omega, alpha=shared.alpha, beta=shared.beta,
+        gamma=shared.gamma, transition_logits=shared.transition_logits,
+        nu_raw=torch.full((4,), 2.0),                # cùng giá trị, nhưng theo trạng thái
+    )
+    a = run_ms_egarch_recursion(returns, shared, init_log_var, init_log_state_prob)
+    b = run_ms_egarch_recursion(returns, per_state, init_log_var, init_log_state_prob)
+    torch.testing.assert_close(a["total_log_lik"], b["total_log_lik"])
+    torch.testing.assert_close(a["nu"], b["nu"])
