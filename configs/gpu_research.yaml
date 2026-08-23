@@ -1,20 +1,59 @@
-# Profile scale-up nhiều seed/nhiều bước ADVI cho máy có CUDA.
-# Chưa chạy - chuẩn bị sẵn để dùng khi chuyển sang máy có GPU.
-device_preference: auto
-window_sessions: null        # dùng toàn bộ chuỗi dữ liệu đã làm sạch
+# Profile chay nghien cuu quy mo day du. MOI gia tri duoi day deu tu mot phep
+# do tren may nay (RTX 4060 / CPU 16 nhan), khong phai uoc luong -- ban truoc
+# cua file nay dat n_steps: 20000 ma khong dua tren phep do nao, va do la mot
+# lan chay 407 GIO (17 ngay) neu chay that.
+
+# CPU, khong phai CUDA. Nghe nguoc doi tren may co GPU, nhung day la ket qua do:
+#
+#   T=1500, n_mc=16, mot buoc ADVI:  CUDA eager 9.618s | CPU 2.172s | CUDA graph 0.204s
+#
+# CUDA graph nhanh nhat rat xa (10.6x so voi CPU), NHUNG viec ghi graph o cua
+# so lon KHONG TAT DINH tren may nay: da do T=1500/2500/3500/4500/5500 ghi
+# duoc, con T=5000/6000/6263 lam ca tien trinh chet voi access violation
+# (0xC0000005). Khong don dieu theo T, VRAM chi 0.07G nen khong phai het bo
+# nho. Mot lan chay nhieu gio khong duoc dat tren mot co che co the sap bat
+# ky luc nao, nen cua so day du chay CPU. Bat use_cuda_graph khi va chi khi
+# cua so du ngan de da kiem chung (xem configs/*_smoke.yaml).
+#
+# CUDA eager thi cham hon CPU 4.4 lan, nen "auto" la lua chon SAI o day.
+device_preference: cpu
+
+window_sessions: null        # toan bo chuoi da lam sach (6263 phien)
+train_frac: 0.7
+val_frac: 0.15
+
+# Tam seed. Chay SONG SONG theo tien trinh (scripts/run_research_fit.py
+# --parallel), khong phai tuan tu: da do 4 fit song song chi cham hon 18% so
+# voi chay don, vi tensor qua nho de dung het nhieu nhan trong mot tien trinh.
+# 8 seed vi the ton gan bang 1 seed ve thoi gian treo tuong.
 seeds: [0, 1, 2, 3, 4, 5, 6, 7]
+
 advi:
-  n_steps: 20000
+  # 1500 chu khong phai 20000. Da do duong hoi tu ELBO tren 4 seed voi
+  # early-stop TAT hoan toan: ELBO phang tu buoc ~630-770, va tu buoc 600 den
+  # buoc 3000 no chi nhich 0.09% (4648 -> 4652). 1500 la gap doi diem phang
+  # do, du bien an toan ma khong phai tra gia cho 18500 buoc vo ich.
+  n_steps: 1500
   learning_rate: 0.01
-  warmup_steps: 500
+  warmup_steps: 100
   grad_clip_norm: 10.0
   elbo_ma_window: 200
-  early_stop_patience: 2000
-  min_delta: 0.0001
+  # Early-stop de rong: diem phang do duoc nam quanh buoc 700, nhung no khac
+  # nhau theo seed (627-767) nen khong duoc cat qua som. min_delta tinh tren
+  # ELBO co do lon ~4650.
+  early_stop_patience: 400
+  min_delta: 0.01
   retry_lr_factor: 0.5
   max_retries: 3
-  n_mc_samples: 8
+  # 16 chu khong phai 4: tren CPU, nang tu 4 len 16 chi ton them 3-8% thoi
+  # gian (2.172s -> 2.355s o n_mc=64), trong khi phuong sai cua uoc luong
+  # gradient ELBO giam theo 1/n_mc. Day la cach re nhat de tan cong dung van
+  # de da do duoc: fit khong on dinh giua cac seed.
+  n_mc_samples: 16
+  # Tat o cua so day du -- xem ghi chu device_preference o tren.
+  use_cuda_graph: false
+
 prior:
   hyper_mean_scale: 1.0
   min_effective_observations: 30.0
-  min_effective_fraction: 0.05   # regime chiếm dưới 5% occupancy -> shrinkage thật sự
+  min_effective_fraction: 0.05   # regime chiem duoi 5% occupancy -> shrinkage that su
