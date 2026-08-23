@@ -9,8 +9,10 @@ import pytest
 import torch
 
 from raemf_mc.bayesian.torch_backend import (
+    AdviConfig,
     FitResult,
     PooledPosterior,
+    fit_mean_field_advi,
     sample_joint_draw,
     sample_joint_draws,
 )
@@ -233,3 +235,139 @@ def test_clamp_saturation_fraction_is_a_tensor_not_a_python_float():
     assert isinstance(frac, torch.Tensor)
     assert frac.device.type == "cuda"
     assert 0.0 <= float(frac) <= 1.0
+
+
+def _graph_advi_fixture(device, n_steps=25, n_mc=8):
+    """Bộ dựng dùng chung cho các test ADVI + CUDA graph."""
+    from raemf_mc.bayesian.priors import HierarchicalPriorConfig
+    from raemf_mc.regime.ms_egarch import build_ms_egarch_log_joint
+
+    layout = MSEGARCHParamLayout()
+    torch.manual_seed(3)
+    returns = (torch.randn(250) * 0.01).to(device)
+    init_log_var, init_log_state_prob = default_recursion_init(
+        layout, dtype=returns.dtype, device=device
+    )
+    prior = HierarchicalPriorConfig(
+        hyper_mean_scale=1.0, min_effective_observations=30.0,
+        min_effective_fraction=0.05,
+    )
+    log_joint = build_ms_egarch_log_joint(
+        returns, init_log_var, init_log_state_prob, prior, layout
+    )
+    kwargs = dict(
+        n_steps=n_steps, learning_rate=0.05, warmup_steps=5, grad_clip_norm=10.0,
+        elbo_ma_window=5, early_stop_patience=10_000, min_delta=0.0,
+        retry_lr_factor=0.5, max_retries=1, n_mc_samples=n_mc,
+    )
+    init_mu = torch.zeros(layout.total, device=device)
+    init_log_sigma = torch.full((layout.total,), -1.0, device=device)
+    return log_joint, kwargs, init_mu, init_log_sigma
+
+
+@cuda_only
+def test_cuda_graph_advi_matches_eager_trajectory(tmp_path):
+    """Đường CUDA graph phải đi CÙNG quỹ đạo với đường eager khi cùng seed.
+
+    Đây là test đã tìm ra một lỗi thật trong chính đợt này: bản đầu dùng
+    `optimizer.state.clear()` để đặt lại Adam sau các bước làm nóng, nhưng
+    xoá dict không zero các tensor moment mà graph đã ghi cứng địa chỉ. Hệ
+    quả rất dễ bị bỏ qua nếu chỉ nhìn kết quả cuối: `elbo[0]` trùng khít ở
+    cả hai đường (nên mọi test "graph chạy được" đều pass), rồi quỹ đạo mới
+    tách ra và `elbo` cuối lệch 6.5e2.
+
+    Dung sai đặt ở mức của tích luỹ float32 qua vài chục bước với thứ tự
+    kernel khác nhau, KHÔNG đòi trùng bit — điều đó không thể yêu cầu giữa
+    một đồ thị đã ghi và một chuỗi lệnh eager.
+    """
+    device = torch.device("cuda")
+    log_joint, kwargs, init_mu, init_log_sigma = _graph_advi_fixture(device)
+
+    results = {}
+    for label, use_graph in (("eager", False), ("graph", True)):
+        config = AdviConfig(**kwargs, use_cuda_graph=use_graph)
+        results[label] = fit_mean_field_advi(
+            log_joint, init_mu, init_log_sigma, config, seed=11, device=device,
+            fallback_log_path=tmp_path / f"fb_{label}.json",
+        )
+
+    eager, graphed = results["eager"], results["graph"]
+    assert not eager.fallback_used and not graphed.fallback_used
+    assert len(eager.elbo_trace) == len(graphed.elbo_trace)
+    # elbo[0] trùng gần như tuyệt đối: cùng eps, cùng tham số ban đầu.
+    assert abs(eager.elbo_trace[0] - graphed.elbo_trace[0]) < 1e-2
+    torch.testing.assert_close(eager.mu, graphed.mu, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        eager.log_sigma, graphed.log_sigma, rtol=1e-2, atol=1e-2
+    )
+
+
+@cuda_only
+def test_cuda_graph_advi_resets_adam_moments_not_just_the_state_dict(tmp_path):
+    """Chốt riêng cơ chế đã hỏng một lần: sau khi dựng graph, các tensor
+    moment của Adam phải THỰC SỰ bằng 0, chứ không chỉ bị bỏ tham chiếu.
+
+    Test ở trên bắt được hệ quả (quỹ đạo lệch) nhưng chỉ khi chạy đủ nhiều
+    bước; test này bắt được nguyên nhân trực tiếp và sẽ chỉ thẳng vào chỗ
+    hỏng nếu ai đó đổi lại cách đặt lại trạng thái.
+    """
+    device = torch.device("cuda")
+    log_joint, kwargs, init_mu, init_log_sigma = _graph_advi_fixture(
+        device, n_steps=1
+    )
+    config = AdviConfig(**kwargs, use_cuda_graph=True)
+    result = fit_mean_field_advi(
+        log_joint, init_mu, init_log_sigma, config, seed=5, device=device,
+        fallback_log_path=tmp_path / "fb.json",
+    )
+    # Một bước duy nhất sau khi đặt lại: giá trị ELBO phải khớp với cùng
+    # một bước chạy trên đường eager, tức Adam đã thực sự khởi hành từ 0.
+    eager_config = AdviConfig(**kwargs, use_cuda_graph=False)
+    eager = fit_mean_field_advi(
+        log_joint, init_mu, init_log_sigma, eager_config, seed=5, device=device,
+        fallback_log_path=tmp_path / "fb_e.json",
+    )
+    assert abs(result.elbo_trace[0] - eager.elbo_trace[0]) < 1e-2
+    torch.testing.assert_close(result.mu, eager.mu, rtol=1e-3, atol=1e-4)
+
+
+@cuda_only
+def test_cuda_graph_refuses_unbatched_log_joint(tmp_path):
+    """Không im lặng tụt xuống đường eager: người gọi đã yêu cầu graph, và
+    chạy chậm hơn 30 lần mà không báo gì là đúng kiểu thất bại âm thầm mà
+    dự án này cấm."""
+    device = torch.device("cuda")
+    layout = MSEGARCHParamLayout()
+
+    def plain_log_joint(theta):
+        return -(theta**2).sum()
+
+    config = AdviConfig(n_steps=2, n_mc_samples=2, use_cuda_graph=True)
+    with pytest.raises(ValueError, match="supports_batched_theta"):
+        fit_mean_field_advi(
+            plain_log_joint,
+            torch.zeros(layout.total, device=device),
+            torch.full((layout.total,), -1.0, device=device),
+            config, seed=0, device=device,
+            fallback_log_path=tmp_path / "fb.json",
+        )
+
+
+def test_cuda_graph_refuses_cpu_device(tmp_path):
+    """Chạy được cả trên máy không có CUDA: yêu cầu graph với device CPU
+    phải báo lỗi rõ ràng thay vì âm thầm bỏ qua cờ."""
+    layout = MSEGARCHParamLayout()
+
+    def plain_log_joint(theta):
+        return -(theta**2).sum()
+
+    plain_log_joint.supports_batched_theta = True
+    config = AdviConfig(n_steps=2, n_mc_samples=2, use_cuda_graph=True)
+    with pytest.raises(ValueError, match="khong phai CUDA"):
+        fit_mean_field_advi(
+            plain_log_joint,
+            torch.zeros(layout.total),
+            torch.full((layout.total,), -1.0),
+            config, seed=0, device=torch.device("cpu"),
+            fallback_log_path=tmp_path / "fb.json",
+        )
