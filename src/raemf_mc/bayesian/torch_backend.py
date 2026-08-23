@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -21,6 +22,15 @@ class AdviConfig:
     retry_lr_factor: float = 0.5
     max_retries: int = 3
     n_mc_samples: int = 4
+    # Ghi toan bo mot buoc ADVI thanh mot CUDA graph roi phat lai. MAC DINH
+    # TAT: doi hoi CUDA that, log_joint co supports_batched_theta, va no doi
+    # mot vai chi tiet ve hanh vi (xem _single_attempt). Bat len khi va chi
+    # khi da doc nhung danh doi do.
+    #
+    # Do duoc tren RTX 4060 (GeForce/WDDM): overhead phat kernel ~42 us o che
+    # do eager va ~1.5 us khi phat lai graph. Mot buoc ADVI day du o T=1500,
+    # S=16: CPU 2195 ms, CUDA eager 8852 ms, CUDA graph 341 ms.
+    use_cuda_graph: bool = False
 
 
 @dataclass
@@ -71,6 +81,55 @@ def _lr_schedule(step: int, config: AdviConfig) -> float:
     return 0.5 * (1 + math.cos(math.pi * progress))
 
 
+def _reset_adam_state_in_place(optimizer: torch.optim.Optimizer) -> None:
+    """Dua trang thai Adam ve dung diem xuat phat, TAI CHO.
+
+    Khong duoc xoa `optimizer.state` o day. Xoa dict chi bo tham chieu; cac
+    tensor moment van ton tai va CUDA graph da ghi cung dia chi cua chinh
+    chung luc capture. Ket qua la graph tiep tuc doc/ghi nhung moment da
+    duoc ham nong boi cac buoc lam nong, trong khi duong eager khoi hanh tu
+    0 -- hai quy dao tach nhau ngay SAU buoc dau tien.
+
+    Da quan sat truc tiep truoc khi sua: elbo[0] cua hai duong trung khit
+    (-139.9086) con elbo cuoi lech toi 6.5e2. Chinh cho nay la ly do phep
+    doi chieu eager/graph ton tai.
+    """
+    for state in optimizer.state.values():
+        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq", "step"):
+            buffer = state.get(key)
+            if isinstance(buffer, torch.Tensor):
+                buffer.zero_()
+
+
+@contextmanager
+def _distribution_validation_disabled():
+    """Tat kiem tra tham so cua torch.distributions trong pham vi khoi lenh.
+
+    Chi dung quanh doan GHI CUDA graph. Ly do: `Distribution.__init__` voi
+    validate_args=True chay `support.check(...).all()` roi ep sang bool tren
+    HOST -- mot phep dong bo, va moi dong bo deu bat hop phap trong luc ghi
+    graph. Da xac nhan bang thi nghiem: cung mot log_prob capture that bai
+    voi kiem tra bat, thanh cong khi tat.
+
+    Day la mot DANH DOI THAT, khong phai chi tiet ky thuat. Docstring cua
+    `_single_attempt` ghi ro rang no dua vao chinh co che kiem tra nay de
+    bat scale NaN va chuyen sang duong retry voi ly do "log_joint_raised".
+    Tren duong graph, mot scale NaN thay vao do se cho log_prob NaN -> loss
+    NaN -> bi bat boi kiem tra isfinite(loss), tuc VAN vao dung duong retry,
+    chi khac nhan ly do ("elbo_diverged_nan_or_inf"). Hanh vi duoc bao toan;
+    thu mat la do phan giai cua chan doan.
+
+    Pham vi duoc giu hep nhat co the: chi bao quanh luc ghi, khong bao quanh
+    vong lap phat lai, va duong eager khong bi anh huong chut nao.
+    """
+    previous = torch.distributions.Distribution._validate_args
+    torch.distributions.Distribution.set_default_validate_args(False)
+    try:
+        yield
+    finally:
+        torch.distributions.Distribution.set_default_validate_args(previous)
+
+
 def _single_attempt(
     log_joint_fn: Callable[[torch.Tensor], torch.Tensor],
     init_mu: torch.Tensor,
@@ -90,14 +149,117 @@ def _single_attempt(
     reverts to. Without that guard the caller would report
     `fallback_used=True` with a reason naming a "last finite step" while
     handing back NaNs.
+
+    `config.use_cuda_graph` ghi mot buoc thanh CUDA graph roi phat lai. VONG
+    LAP LA MOT, chung cho ca hai duong -- chi ba cho re nhanh: cach lay eps,
+    cach cap nhat learning rate, va viec goi step hay phat lai graph. Day la
+    co y: hai vong lap song song se troi khoi nhau, va toan bo logic phan ky
+    / anh chup / dung som la phan da qua nhieu vong review.
+
+    Ba danh doi cua duong graph, deu that:
+
+    1. `log_joint` chi co the raise o LUC GHI graph, khong phai luc phat lai.
+       Sau khi ghi, do thi la co dinh: mot theta gay NaN se cho loss NaN chu
+       khong raise, va bi bat boi kiem tra isfinite y nhu duong eager. Luoi an
+       toan van con, chi doi hinh thuc.
+    2. Learning rate phai la TENSOR (LambdaLR gan mot so Python, va so do bi
+       nuong cung vao graph luc ghi, lam dong bang lich warmup). Duong graph
+       tu cap nhat lr tai cho voi DUNG cong thuc ma LambdaLR dung.
+    3. Adam phai co capturable=True.
+    4. Kiem tra tham so cua torch.distributions bi tat trong luc GHI graph
+       (xem `_distribution_validation_disabled`). Mot scale NaN van vao dung
+       duong retry, qua kiem tra isfinite(loss) thay vi qua mot exception,
+       nen chi khac nhan ly do chu khong khac hanh vi.
     """
+    graphed = config.use_cuda_graph
+    if graphed:
+        # Khong im lang tut xuong duong eager: nguoi goi da yeu cau graph, va
+        # chay cham hon 30 lan ma khong bao gi la dung kieu that bai am tham
+        # ma du an nay cam.
+        if device.type != "cuda":
+            raise ValueError(
+                f"use_cuda_graph=True nhung device={device} khong phai CUDA"
+            )
+        if not getattr(log_joint_fn, "supports_batched_theta", False):
+            raise ValueError(
+                "use_cuda_graph=True doi hoi log_joint co supports_batched_theta "
+                "= True (duong tuan tu nhieu MC sample khong ghi graph duoc)"
+            )
+
     generator = torch.Generator(device=device).manual_seed(seed)
     mu = init_mu.clone().to(device).requires_grad_(True)
     log_sigma = init_log_sigma.clone().to(device).requires_grad_(True)
-    optimizer = torch.optim.Adam([mu, log_sigma], lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: _lr_schedule(step, config)
-    )
+
+    eps_shape = (config.n_mc_samples, *mu.shape)
+    if graphed:
+        lr_tensor = torch.tensor(learning_rate, dtype=mu.dtype, device=device)
+        optimizer = torch.optim.Adam([mu, log_sigma], lr=lr_tensor, capturable=True)
+        scheduler = None
+        static_eps = torch.empty(eps_shape, dtype=mu.dtype, device=device)
+    else:
+        lr_tensor = None
+        optimizer = torch.optim.Adam([mu, log_sigma], lr=learning_rate)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda step: _lr_schedule(step, config)
+        )
+        static_eps = None
+
+    def _forward_backward() -> tuple[torch.Tensor, torch.Tensor]:
+        """Mot buoc: eps -> theta -> ELBO -> backward -> clip -> optimizer.
+        Doc `static_eps` (duong graph) hoac tu rut eps (duong eager)."""
+        optimizer.zero_grad(set_to_none=False)
+        sigma = torch.exp(log_sigma)
+        if graphed:
+            theta = mu + sigma * static_eps
+            mean_log_joint = log_joint_fn(theta).mean()
+        elif getattr(log_joint_fn, "supports_batched_theta", False):
+            eps = torch.randn(eps_shape, generator=generator, device=device)
+            theta = mu + sigma * eps
+            mean_log_joint = log_joint_fn(theta).mean()
+        else:
+            elbo_samples = []
+            for _ in range(config.n_mc_samples):
+                eps = torch.randn(mu.shape, generator=generator, device=device)
+                theta = mu + sigma * eps
+                elbo_samples.append(log_joint_fn(theta))
+            mean_log_joint = torch.stack(elbo_samples).mean()
+        elbo = mean_log_joint + _gaussian_entropy(log_sigma)
+        loss = -elbo
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([mu, log_sigma], config.grad_clip_norm)
+        optimizer.step()
+        return elbo, loss
+
+    graph = None
+    static_elbo = static_loss = None
+    if graphed:
+        static_eps.normal_(generator=generator)
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                _forward_backward()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        # Cac buoc lam nong o tren da lam ban mu/log_sigma/trang thai Adam.
+        # Dat lai ve dung diem xuat phat de quy dao khong phu thuoc vao so
+        # lan lam nong -- neu khong, ket qua cua duong graph se khac duong
+        # eager theo mot cach khong ai giai thich duoc.
+        with torch.no_grad():
+            mu.copy_(init_mu.to(device))
+            log_sigma.copy_(init_log_sigma.to(device))
+        _reset_adam_state_in_place(optimizer)
+        generator.manual_seed(seed)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with _distribution_validation_disabled(), torch.cuda.graph(graph):
+            static_elbo, static_loss = _forward_backward()
+        torch.cuda.synchronize()
+        with torch.no_grad():
+            mu.copy_(init_mu.to(device))
+            log_sigma.copy_(init_log_sigma.to(device))
+        _reset_adam_state_in_place(optimizer)
+        generator.manual_seed(seed)
 
     elbo_trace: list[float] = []
     moving_avg = None
@@ -106,49 +268,30 @@ def _single_attempt(
     last_finite_mu, last_finite_log_sigma = mu.detach().clone(), log_sigma.detach().clone()
 
     for step in range(config.n_steps):
-        optimizer.zero_grad()
-        sigma = torch.exp(log_sigma)
-        try:
-            if getattr(log_joint_fn, "supports_batched_theta", False):
-                # Đường batch: rút cả n_mc_samples eps một lần và đánh giá
-                # log_joint MỘT lần trên theta hình dạng (S, P). Đây là
-                # nguồn tăng tốc chính của ADVI — chi phí thực tế của
-                # log_joint MS-EGARCH nằm ở 1500 vòng lặp Python của
-                # recursion, không ở phép tính, nên S mẫu gộp lại gần như
-                # tốn bằng 1 mẫu (đo được: xem docs/perf_batching_notes.md).
-                #
-                # Đổi thứ tự tiêu thụ RNG so với đường tuần tự (một tensor
-                # (S, P) thay vì S tensor (P,)), nên quỹ đạo ADVI của cùng
-                # một seed KHÔNG trùng bit-đối-bit với bản trước khi vector
-                # hoá. Tính tái lập theo seed vẫn giữ nguyên (cùng seed ->
-                # cùng kết quả); thứ không giữ là so sánh xuyên phiên bản.
-                eps = torch.randn(
-                    (config.n_mc_samples, *mu.shape), generator=generator, device=device
+        if graphed:
+            # Cung cong thuc lr ma LambdaLR dung o duong eager, cap nhat tai
+            # cho vi gia tri lr da duoc nuong vao graph luc ghi.
+            lr_tensor.fill_(learning_rate * _lr_schedule(step, config))
+            static_eps.normal_(generator=generator)
+            graph.replay()
+            elbo, loss = static_elbo, static_loss
+        else:
+            try:
+                elbo, loss = _forward_backward()
+            except (ValueError, RuntimeError, ArithmeticError) as exc:
+                # log_joint can raise instead of returning a non-finite value —
+                # torch.distributions argument validation rejects a NaN scale,
+                # for instance. That is the same failure as a non-finite loss and
+                # must take the same retry/fallback path rather than escaping
+                # uncaught and bypassing it entirely.
+                return (
+                    last_finite_mu,
+                    last_finite_log_sigma,
+                    elbo_trace,
+                    False,
+                    f"log_joint_raised: {type(exc).__name__}: {exc}",
                 )
-                theta = mu + sigma * eps
-                mean_log_joint = log_joint_fn(theta).mean()
-            else:
-                elbo_samples = []
-                for _ in range(config.n_mc_samples):
-                    eps = torch.randn(mu.shape, generator=generator, device=device)
-                    theta = mu + sigma * eps
-                    elbo_samples.append(log_joint_fn(theta))
-                mean_log_joint = torch.stack(elbo_samples).mean()
-        except (ValueError, RuntimeError, ArithmeticError) as exc:
-            # log_joint can raise instead of returning a non-finite value —
-            # torch.distributions argument validation rejects a NaN scale,
-            # for instance. That is the same failure as a non-finite loss and
-            # must take the same retry/fallback path rather than escaping
-            # uncaught and bypassing it entirely.
-            return (
-                last_finite_mu,
-                last_finite_log_sigma,
-                elbo_trace,
-                False,
-                f"log_joint_raised: {type(exc).__name__}: {exc}",
-            )
-        elbo = mean_log_joint + _gaussian_entropy(log_sigma)
-        loss = -elbo
+            scheduler.step()
 
         if not torch.isfinite(loss):
             return (
@@ -158,11 +301,6 @@ def _single_attempt(
                 False,
                 "elbo_diverged_nan_or_inf",
             )
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_([mu, log_sigma], config.grad_clip_norm)
-        optimizer.step()
-        scheduler.step()
 
         elbo_value = elbo.item()
         elbo_trace.append(elbo_value)

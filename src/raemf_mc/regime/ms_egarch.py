@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -50,6 +51,8 @@ CLAMP_SATURATION_REPORT_FRACTION = 0.05
 # inside float32's safe range in both directions, so every division in the
 # recursion stays well-conditioned regardless of what ADVI samples.
 _LOG_VAR_CLAMP = 30.0
+
+_LOG_PI = math.log(math.pi)
 
 
 @dataclass(frozen=True)
@@ -169,6 +172,17 @@ def default_recursion_init(
     return init_log_var, init_log_state_prob
 
 
+@lru_cache(maxsize=None)
+def _next_float_above(value: float, dtype: torch.dtype) -> float:
+    """Số biểu diễn được kế tiếp lớn hơn `value` TRONG `dtype`, trả về dưới
+    dạng số Python. Phải theo dtype vì ULP của float32 tại 2.05 lớn hơn
+    float64 nhiều bậc; dùng nextafter của float64 sẽ cho một giá trị mà
+    float32 làm tròn ngược về đúng `value`, làm bất đẳng thức ngặt mà
+    `nu_from_raw` cam kết trở nên vô hiệu."""
+    t = torch.tensor(value, dtype=dtype)
+    return float(torch.nextafter(t, torch.tensor(math.inf, dtype=dtype)))
+
+
 def nu_from_raw(nu_raw: torch.Tensor, min_nu: float = 2.05) -> torch.Tensor:
     """nu = min_nu + softplus(nu_raw), guaranteed strictly > min_nu.
 
@@ -180,11 +194,17 @@ def nu_from_raw(nu_raw: torch.Tensor, min_nu: float = 2.05) -> torch.Tensor:
     float above min_nu enforces the intended strict inequality without
     perturbing normal-range values, where softplus is many orders above
     the ULP and the clamp is a no-op.
+
+    Cận dưới được tính bằng số Python chứ không phải tensor. Bản trước gọi
+    `torch.as_tensor(min_nu, device=nu.device)`, tạo một scalar trên CPU rồi
+    sao chép sang GPU ở MỖI lần gọi. Ngoài việc lãng phí, phép sao chép đó
+    khiến hàm này không thể nằm trong một CUDA graph: mọi chuyển dữ liệu
+    CPU<->GPU đều bất hợp pháp trong lúc ghi graph (đã tái hiện được — capture
+    thất bại đúng tại dòng này). `torch.clamp` nhận số Python trực tiếp và
+    không cấp phát gì.
     """
     nu = min_nu + torch.nn.functional.softplus(nu_raw)
-    min_nu_t = torch.as_tensor(min_nu, dtype=nu.dtype, device=nu.device)
-    floor = torch.nextafter(min_nu_t, torch.full_like(min_nu_t, math.inf))
-    return torch.clamp(nu, min=floor)
+    return torch.clamp(nu, min=_next_float_above(min_nu, nu.dtype))
 
 
 def expected_abs_standardized_t(nu: torch.Tensor) -> torch.Tensor:
@@ -203,7 +223,12 @@ def _student_t_log_pdf(
     log_norm = (
         torch.lgamma((nu + 1) / 2)
         - torch.lgamma(nu / 2)
-        - 0.5 * torch.log(nu * torch.tensor(math.pi))
+        # log(nu * pi) tách thành log(nu) + log(pi): bản trước gọi
+        # `torch.tensor(math.pi)`, tạo scalar CPU rồi sao chép sang device mỗi
+        # lần gọi — chặn CUDA graph capture y như nu_from_raw. Tách ra còn
+        # TỐT HƠN về số học: tích nu*pi có thể tràn ở nu rất lớn, còn tổng
+        # hai log thì không, và log(pi) là hằng số Python không cấp phát gì.
+        - 0.5 * (torch.log(nu) + _LOG_PI)
         - torch.log(scale)
     )
     return log_norm + log_kernel
@@ -333,6 +358,11 @@ def run_ms_egarch_recursion(
         log_filt_prev = log_filt_t
 
     n_cells = max(T * n * B, 1)
+    # Tensor, KHÔNG phải float. `float(n_saturated)` là một phép đồng bộ
+    # GPU->CPU, và mọi đồng bộ đều bất hợp pháp trong lúc ghi CUDA graph —
+    # đây là chỗ capture thất bại đầu tiên khi thử. Người gọi đổi sang float
+    # ở NGOÀI vùng capture; xem `fit_ms_egarch`.
+    clamp_saturation_fraction = n_saturated / n_cells
     if not is_batched:
         log_var = log_var.squeeze(0)
         log_filtered = log_filtered.squeeze(0)
@@ -345,7 +375,7 @@ def run_ms_egarch_recursion(
         "log_var_bar": log_var_bar,
         "total_log_lik": total_log_lik,
         "nu": nu,
-        "clamp_saturation_fraction": float(n_saturated) / n_cells,
+        "clamp_saturation_fraction": clamp_saturation_fraction,
     }
 
 
@@ -402,9 +432,14 @@ def build_ms_egarch_log_joint(
         log_lik = result["total_log_lik"]
 
         if diagnostics is not None:
+            # Tích luỹ bằng torch.maximum trên TENSOR: `max()` của Python trên
+            # một tensor buộc phải so sánh trên host, tức đồng bộ GPU->CPU,
+            # tức không capture được. Giá trị chỉ được đổi sang float một lần
+            # ở cuối `fit_ms_egarch`, ngoài mọi vùng capture.
             frac = result["clamp_saturation_fraction"]
-            diagnostics["max_clamp_saturation_fraction"] = max(
-                diagnostics.get("max_clamp_saturation_fraction", 0.0), frac
+            prev = diagnostics.get("max_clamp_saturation_fraction")
+            diagnostics["max_clamp_saturation_fraction"] = (
+                frac if prev is None else torch.maximum(prev, frac)
             )
             diagnostics["n_log_joint_evals"] = diagnostics.get("n_log_joint_evals", 0) + 1
 
@@ -479,7 +514,10 @@ def fit_ms_egarch(
         log_joint, init_mu, init_log_sigma, advi_config, seeds, device, fallback_log_path
     )
 
-    max_saturation = diagnostics.get("max_clamp_saturation_fraction", 0.0)
+    # Điểm đồng bộ DUY NHẤT cho chẩn đoán này, đặt sau khi ADVI đã chạy xong
+    # nên không nằm trong bất kỳ vùng capture nào.
+    max_saturation_t = diagnostics.get("max_clamp_saturation_fraction")
+    max_saturation = 0.0 if max_saturation_t is None else float(max_saturation_t)
     if max_saturation > CLAMP_SATURATION_REPORT_FRACTION:
         append_fallback_log(
             {
