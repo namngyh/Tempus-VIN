@@ -1,0 +1,63 @@
+# Profile walk-forward OOS quy mo SMOKE.
+#
+# Walk-forward nghia la fit lai MS-EGARCH + mu_k MOT LAN CHO MOI MOC, nen
+# ADVI o day phai nhe hon HAN moi smoke config khac. Do duoc tren may nay:
+# mot fit o cua so day du ton 71 phut; 8 moc x cau hinh nghien cuu la ~9 gio
+# chi cho phan fit. Cau hinh duoi day nham vao ~10-15 phut tong.
+#
+# HE QUA PHAI DOC KY: o quy mo nay moi con so sinh ra la de XAC NHAN DUONG
+# ONG NOI DUNG, khong phai ket qua nghien cuu.
+#   - Kiem dinh Kupiec voi 8 moc va p=0.05 co so vi pham ky vong la 0.4.
+#     Quan sat 0 hay 1 lan deu KHONG phan biet duoc VaR dung voi VaR sai he
+#     thong. Kiem dinh khong co suc manh o co mau nay -- xem canh bao trong
+#     docstring cua compute_kupiec_lr.
+#   - CRPS/WIS phan anh chat luong cua mot fit ADVI 200 buoc (gan nhu chac
+#     chan chua hoi tu: da do ELBO chi phang tu buoc ~700), khong phai tinh
+#     chat cua ban than metric.
+# Muon so lieu that thi phai chay lai voi ADVI nang hon va hang chuc moc, va
+# do la mot lan chay tinh bang ngay chu khong phai phut.
+
+device_preference: cpu       # xem ghi chu trong gpu_research.yaml ve CUDA graph
+
+window_sessions: 2500        # du sau de moi moc con cua so fit hop ly
+horizon: 20                  # 20 phien ~ mot thang giao dich
+n_cutoffs: 8
+mc_n_paths: 500
+var_alphas: [0.95, 0.99]
+seeds: [0]
+
+ms_egarch_advi:
+  n_steps: 200
+  learning_rate: 0.05
+  warmup_steps: 20
+  grad_clip_norm: 10.0
+  elbo_ma_window: 20
+  early_stop_patience: 100
+  min_delta: 0.001
+  retry_lr_factor: 0.5
+  max_retries: 3
+  n_mc_samples: 16           # 16 chu khong phai 4: do duoc chi ton them 3-8%
+  use_cuda_graph: false
+
+ms_egarch_prior:
+  hyper_mean_scale: 1.0
+  min_effective_observations: 30.0
+  min_effective_fraction: 0.05
+
+mu_advi:
+  n_steps: 200
+  learning_rate: 0.05
+  warmup_steps: 20
+  grad_clip_norm: 10.0
+  elbo_ma_window: 20
+  early_stop_patience: 100
+  min_delta: 0.001
+  retry_lr_factor: 0.5
+  max_retries: 3
+  n_mc_samples: 16
+  use_cuda_graph: false
+
+mu_n_draws: 30
+mu_prior_scale: 0.01
+mu_min_effective_observations: 30.0
+mu_min_effective_fraction: 0.05
