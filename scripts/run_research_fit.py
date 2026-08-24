@@ -94,9 +94,10 @@ def main() -> int:
     with args.config.open(encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    device = select_device(config.get("device_preference", "auto"))
+    preference = config.get("device_preference", "auto")
+    device = select_device(preference)
     print("=" * 70)
-    for key, value in hardware_report().items():
+    for key, value in hardware_report(preference).items():
         print(f"  {key}: {value}")
     print(f"  config: {args.config}")
     print("=" * 70, flush=True)

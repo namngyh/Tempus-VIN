@@ -1,0 +1,9 @@
+[
+  {
+    "reason": "log_var_clamp_saturation",
+    "max_clamp_saturation_fraction": 0.31075358390808105,
+    "threshold": 0.05,
+    "n_log_joint_evals": 1500,
+    "detail": "log_var hit the +/-30 clamp in a large fraction of (timestep, state) cells; those cells have zero gradient, so ADVI saw a flat plateau instead of a divergence"
+  }
+]

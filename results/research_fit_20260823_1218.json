@@ -1,0 +1,67 @@
+{
+  "config": "configs\\gpu_research.yaml",
+  "elapsed_seconds": 34075.4312947,
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "n_sessions": 6263,
+  "n_train": 4384,
+  "health": {
+    "healthy": true,
+    "problems": [],
+    "occupancy": [
+      0.3868,
+      0.2078,
+      0.0997,
+      0.3056
+    ],
+    "max_occupancy_share": 0.3868,
+    "n_label_classes": 2,
+    "top_label_share": 0.5817,
+    "label_counts": {
+      "Bull": 2550,
+      "Stress": 1834
+    },
+    "nu": 2.909,
+    "clamp_saturation_fraction": 0.0
+  },
+  "nu_by_state": [
+    3.2457,
+    3.0613,
+    2.909,
+    3.1224
+  ],
+  "self_transition": [
+    0.9754,
+    0.9505,
+    0.7609,
+    0.9538
+  ],
+  "elbo_final": [
+    13189.3896484375,
+    13175.8505859375,
+    13201.79296875,
+    13215.7763671875,
+    13201.9521484375,
+    13179.9287109375,
+    13208.5205078125,
+    13196.33984375
+  ],
+  "fallback_used": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+  ]
+}
