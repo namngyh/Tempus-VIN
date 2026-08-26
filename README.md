@@ -49,129 +49,62 @@ mục "Trạng thái hiện tại" dưới đây để biết chính xác test n
 | 1 | Nền tảng + Lõi MS-EGARCH | Ingest dữ liệu, hạ tầng ADVI dùng chung, mô hình MS-EGARCH 4 trạng thái | **Xong, đã merge `master`, đã push GitHub** |
 | 2 | EBM classifier + calibration | Phân loại regime từ đặc trưng OHLCV nhân quả + posterior sigma_t của MS-EGARCH, temperature calibration | **Xong, đã merge `master`, đã push GitHub** |
 | 3 | Scenario-return + Monte Carlo + VaR/CVaR | Fit mu_k theo regime, mô phỏng Monte Carlo tiến, tính VaR/CVaR/drawdown | **Xong, đã merge `main`** (chưa push — xem mục dưới) |
-| 4 | Đánh giá OOS + Model card | Hoàn thiện đánh giá EBM (macro F1, recall Bear/Stress, NLL), walk-forward OOS (CRPS/WIS/Kupiec), model card | **Mới bắt đầu, chưa có code — xem mục dưới** |
+| 4 | Đánh giá OOS + Model card | Hoàn thiện đánh giá EBM (macro F1, recall Bear/Stress, NLL), walk-forward OOS (CRPS/WIS/Kupiec), model card | **Xong** — xem `docs/model_card.md` |
 
 ---
 
-## Trạng thái hiện tại (2026-08-20) — đang trên máy GPU
+## Kết quả (2026-08-24)
 
-Máy GPU đã sẵn sàng và **sub-project 3 đã được merge vào `main`**. Full suite:
-**130 passed, 0 failed** (49 phút, gồm cả ba integration test chạy thật trên
-dữ liệu VN-Index). **Chưa push lên GitHub** — `main` cục bộ đang đi trước
-`origin/main`.
+Cả 4 sub-project đã xong và merge vào `main`. **Đọc `docs/model_card.md`
+trước khi diễn giải bất kỳ con số nào dưới đây** — đặc biệt mục 4, nơi liệt
+kê những gì mô hình này CHƯA chứng minh được.
 
-### Việc đã làm trên máy GPU (2026-08-19 → 20)
+### Fit MS-EGARCH quy mô nghiên cứu
 
-**1. Vector hoá theo chiều batch.** Đo lần đầu trên GPU thật cho kết quả
-ngược với kỳ vọng: CUDA **chậm hơn** CPU 5,6× ở recursion và 4,9× ở ADVI, vì
-gần như toàn bộ chi phí là 1500 vòng lặp Python trên tensor 4 phần tử chứ
-không phải phép tính. Đã bỏ chiều batch dẫn đầu vào recursion / ADVI /
-Monte Carlo / `mu_fit`. Kết quả đo được:
+`configs/gpu_research.yaml`: 6 263 phiên (train 4 384), 8 seed song song,
+1 500 bước ADVI, `n_mc_samples=16`, CPU. Thời gian thật **9,5 giờ**
+(71 phút/seed).
 
-| | trước | sau |
-|---|---|---|
-| ADVI 20 bước × 4 MC sample (T=1500, CPU) | 126,5 s | **34,9 s** (3,6×) |
-| `simulate_mc_paths` 500 path (CPU) | ~275 s | **2,5 s** (~110×) |
-| integration test sub-project 3 | ~90 phút | **11 phút 36** |
+| | |
+|---|---|
+| `regime_health_report` | **healthy: True** |
+| Occupancy 4 chế độ | 0,3868 · 0,2078 · 0,0997 · 0,3056 |
+| ELBO cuối, 8 seed | 13 175,85 … 13 215,78 (chênh 0,3%) |
+| Seed rơi vào fallback | 0/8 |
+| `nu` theo chế độ | 3,246 · 3,061 · 2,909 · 3,122 |
 
-Và `n_mc_samples` từ 4 lên 16 chỉ tốn thêm **3%** — chất lượng gradient ELBO
-giờ gần như miễn phí. Chi tiết đầy đủ: `docs/perf_batching_notes.md`.
+Trước đó, cấu hình smoke cũ cho occupancy `[0,827 · 0,074 · 0,072 · 0,028]`
+và nhãn suy biến hoàn toàn về một lớp (1 049/1 049 phiên).
 
-**2. Sửa một bug đường CUDA thật.** `sample_joint_draw` gọi `torch.randint`
-thiếu `device=`, nên với generator CUDA nó raise `Expected a 'cpu' device
-type for generator but found 'cuda'` — chắn ngang toàn bộ tầng Monte Carlo
-trên GPU. Repo trước đó **không có một test nào chạm GPU**; giờ có 4
-(`tests/runtime/test_cuda_device_path.py`, tự skip trên máy không CUDA).
+### Hiệu năng
 
-**3. Chẩn đoán fit regime suy biến** (`regime_health_report`). Đo được: mọi
-chẩn đoán cũ đều báo sạch (`fallback_used=False`, `clamp_saturation=0`, ELBO
-bình thường) trong khi nhãn regime là 1049/1049 phiên cùng một lớp và
-`nu`=2,15–2,21 sát sàn 2,05. Đó đúng nghĩa là silent fallback mà `AGENTS.md`
-cấm.
+Một bước ADVI, T=1 500, `n_mc=16`, trên RTX 4060 (WDDM) + CPU 16 nhân:
 
-**4. Đổi scheme gán nhãn regime** từ `argmax` thô sang chuẩn hoá theo tần
-suất nền. Xem mục "Nhãn regime đã đổi nghĩa" dưới đây — đây là thay đổi
-quan trọng nhất cần biết khi đọc bất kỳ kết quả nào.
+| Đường | s/bước |
+|---|---|
+| CUDA eager | 9,618 |
+| CPU | 2,172 |
+| **CUDA graph** | **0,204** |
 
-### Nhãn regime đã ĐỔI NGHĨA
+Toàn bộ khoảng cách GPU/CPU của dự án này là overhead phát kernel (~42 µs
+eager so với ~1,5 µs graph), không phải tính toán. Chi tiết:
+`docs/perf_batching_notes.md`.
 
-Nhãn không còn trả lời *"hôm nay chế độ nào khả năng cao nhất"* mà trả lời
-*"hôm nay chế độ nào đang hoạt động BẤT THƯỜNG so với mức thường của nó"*.
-Mọi metric tính trên nhãn này — macro F1, recall Bear/Stress, NLL trước/sau
-calibration — phải được đọc theo nghĩa thứ hai. **Phải ghi vào model card.**
+### Ba điều phải biết trước khi dùng số liệu
 
-Lý do: với một fit có occupancy `[0,724, 0,202, 0,052, 0,022]`, chế độ thứ
-hai giữ 20,2% khối lượng trung bình nhưng chỉ được gán nhãn ở **47/1049**
-phiên — nó hầu như không bao giờ *vượt* chế độ dẫn đầu ở bất kỳ ngày cụ thể
-nào, nên `argmax` thô vứt bỏ toàn bộ biến thiên theo thời gian mà bộ lọc
-thật sự có. Ablation 4 seed × 2 cấu hình (chạy cả hai scheme trên cùng
-`log_filtered_prob` đã fit): `argmax` cho mục tiêu **đơn lớp ở 5/8** trường
-hợp, `base_rate` **0/8**. Chi tiết và cả tiêu chí mà `base_rate` THUA nằm
-trong docstring của `label_indices_from_filtered`.
+1. **Walk-forward OOS chưa có sức mạnh thống kê.** 8 mốc, p=0,05 → số vi
+   phạm kỳ vọng 0,4. Kiểm định Kupiec ở cỡ mẫu này xác nhận công thức chạy
+   đúng, không xác nhận mô hình hiệu chỉnh đúng.
+2. **Nhãn chế độ đã đổi nghĩa** — "chế độ nào hoạt động bất thường so với
+   mức thường của nó", không phải "chế độ nào khả năng cao nhất".
+3. **VaR/CVaR chưa đáng tin.** `nu ≈ 3` nên kurtosis vẫn vô hạn (cần
+   `nu > 4`).
 
-Trên dữ liệu thật, `test_ebm_integration_smoke` đi từ `{Sideway: 1049}` sang
-`{Sideway: 508, Stress: 279, Bear: 218, Bull: 2}`.
+### Việc còn lại, không nằm trong 4 sub-project
 
-### Sub-project 4 (branch `evaluation-model-card`)
-
-Vẫn chỉ có spec (`docs/superpowers/specs/2026-08-18-evaluation-model-card-design.md`)
-và plan 8-task (`docs/superpowers/plans/2026-08-18-evaluation-model-card.md`)
-— **chưa có dòng code nào**. Phụ thuộc chéo branch đã được gỡ: `fit_regime_mu`,
-`simulate_mc_paths`, `compute_var` giờ đã có trên `main`, nên chỉ cần merge
-`main` vào worktree đó rồi làm tuần tự từ Task 1.
-
-**Ba điều chỉnh thiết kế nên đưa vào trước khi bắt đầu**, rút ra từ số đo
-của phiên này:
-
-1. **Task 4 (walk-forward) nên chạy song song theo tiến trình, không phải
-   batch.** Các mốc có độ dài cửa sổ khác nhau nên không gộp được vào chiều
-   batch, nhưng chúng độc lập hoàn toàn và máy này có 16 nhân. Đã kiểm chứng
-   thật: 9 fit song song mất 24 phút thay vì ~107 phút tuần tự (~4,4×).
-2. **Tách `device` theo tầng.** Xem "Chuyện GPU" dưới đây.
-3. **Nâng `n_mc_samples`** trong mọi config (4 → 16+), vì nó gần như miễn phí.
-
-### Việc còn phải làm, theo thứ tự
-
-1. **Push lên GitHub**: `git push origin main:main` (chưa làm).
-2. **Chốt chính sách `ruff`**: ruff 0.16.3 báo **40 lỗi có sẵn** trên code
-   chưa đụng vào, vì `pyproject.toml` chỉ đặt `line-length` mà không khai
-   báo `[tool.ruff.lint] select` — phiên bản mới bật thêm nhiều rule mặc
-   định. Cần chọn: khai báo `select` để cố định chính sách, hoặc ghim phiên
-   bản ruff. Không nên im lặng format lại 40 chỗ.
-3. **`canonical_theta` khi nhiều seed — CHẶN `gpu_research.yaml`.** Đo được
-   label switching giữa các seed: chỉ số state thô đứng đầu đổi theo seed
-   (3, 2, 2, 3 trên 4 seed thử), và cấu trúc occupancy khác hẳn nhau. Nhưng
-   `canonical_theta` làm `mus.mean(dim=0)` — trung bình cộng tham số qua các
-   seed. Trung bình `omega[3]` của seed 0 với `omega[3]` của seed 1 khi hai
-   chỉ số đó chỉ hai chế độ khác nhau là phép toán vô nghĩa. Chưa cắn ai vì
-   mọi config smoke dùng `seeds: [0]`, nhưng `gpu_research.yaml` dùng 8 seed.
-   Phải căn chỉnh trạng thái trước khi trung bình, hoặc bỏ hẳn cách trung
-   bình tham số. (`sample_joint_draw` an toàn — nó chọn một seed rồi mới rút.)
-4. **Batch theo seed trong ADVI** — nguồn tăng tốc lớn nhất còn lại cho
-   `gpu_research.yaml` (8 seed → 1 lần chạy). Chưa làm vì logic
-   retry/fallback là theo từng seed, gộp lại phải viết lại bằng mặt nạ theo
-   hàng, chạm đúng quy tắc "không silent fallback".
-5. **Đo thật ở T đầy đủ (~6 264 phiên)** rồi mới chốt `gpu_research.yaml`.
-   Mọi số đo hiện có đều ở T=1500; T đầy đủ dự kiến đắt hơn ~4,2× nhưng đó
-   là **ngoại suy chưa kiểm chứng**. Không nên khởi động một lần chạy nhiều
-   giờ dựa trên giả định.
-6. **Sub-project 4**, 8 task theo plan.
-7. Sau cùng: chạy nghiên cứu quy mô thật → số liệu cho model card và phần
-   "Kết quả" của README này (ghi rõ smoke-scale hay không).
-
-### Chuyện GPU — kết luận ngược với dự đoán ban đầu
-
-`device_preference: auto` **không phải** lựa chọn tốt cho mọi tầng. Trên máy
-này `auto` chọn CUDA, và điều đó làm **ADVI chậm đi ~4,3 lần**.
-
-| Tầng | Nên chạy ở đâu | Vì sao |
-|---|---|---|
-| ADVI (fit MS-EGARCH, mu_k) | **CPU** | batch thực tế chỉ 16×4 = 64 phần tử, quá nhỏ để bù overhead phát kernel |
-| Monte Carlo | **GPU khi n_paths ≳ 2 000–3 000** | dưới ngưỡng CPU thắng; trên ngưỡng thời gian CUDA gần như phẳng |
-
-Số đo Monte Carlo (T=1500, horizon=20): 500 path — CPU 2,49 s / CUDA 6,03 s;
-5 000 path — CPU 13,79 s / CUDA 5,64 s; 20 000 path — CPU 19,85 s / **CUDA
-5,68 s**.
+Lưu/tải mô hình, CLI orchestration, đường nạp dữ liệu sống. Ba mảnh này bắt
+buộc để vận hành thật và chưa mảnh nào tồn tại — xem `docs/model_card.md`
+mục 4.8.
 
 ---
 
@@ -240,7 +173,7 @@ src/raemf_mc/
   models/          # EBM classifier + calibration (sub-project 2)
   scenario/        # fit mu_k + mô phỏng Monte Carlo (sub-project 3, trên branch scenario-mc-var)
   risk/            # VaR/CVaR/drawdown (sub-project 3, trên branch scenario-mc-var)
-  evaluation/      # (sub-project 4, đang làm, trên branch evaluation-model-card)
+  evaluation/      # metric phân loại, CRPS/WIS, Kupiec, walk-forward OOS (sub-project 4)
   validation/      # split, leakage checks (dùng chung)
 configs/           # các profile ADVI (cpu_smoke, ebm_smoke, mc_smoke, gpu_research-stub)
 docs/
@@ -248,5 +181,8 @@ docs/
   superpowers/plans/    # implementation plan từng sub-project
   perf_batching_notes.md # số đo hiệu năng CPU/GPU thật + điểm giao + việc chưa làm
   sdd-records/          # ledger + báo cáo debug của sub-project 3
-  model_card.md         # (sẽ có sau sub-project 4)
+  model_card.md         # ĐỌC TRƯỚC khi diễn giải bất kỳ số liệu nào
+scripts/
+  run_research_fit.py   # fit quy mô nghiên cứu + báo cáo sức khoẻ, --parallel
+results/                # báo cáo JSON của các lần chạy nghiên cứu
 ```
